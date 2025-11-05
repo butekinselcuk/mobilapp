@@ -1,0 +1,11 @@
+hadis_id,kitap,bab,hadis_no,arabic_text,turkish_text,tags,topic,authenticity,narrator_chain,related_ayah,context,source,reference,category,language,embedding,created_at
+1001,Sahih Bukhari,İman,1,عَنْ أَبِي هُرَيْرَةَ ...,Ebu Hureyre'den rivayet edildi...,"[\"iman\"]",iman,Sahih,"[\"Ebu Hureyre\"]","[\"2:3\"]",Kısa açıklama,sahih-bukhari,Buhari 1,İnanç,tr,,2024-07-14
+1002,Sahih Muslim,Temizlik,2,عَنْ عَائِشَةَ ...,Aişe'den rivayet edildi...,"[\"temizlik\"]",temizlik,Sahih,"[\"Aişe\"]","[\"2:222\"]",Kısa açıklama,sahih-muslim,Muslim 2,İbadet,tr,,2024-07-14
+1003,İbn Mace,Oruç,3,عَنْ أَنَسٍ ...,Enes'ten rivayet edildi...,"[\"oruç\"]",oruç,Hasen,"[\"Enes\"]","[\"2:185\"]",Kısa açıklama,ibn-mace,İbn Mace 3,İbadet,tr,,2024-07-14
+1004,Tirmizi,Zekat,4,عَنْ عُمَرَ ...,Ömer'den rivayet edildi...,"[\"zekat\"]",zekat,Sahih,"[\"Ömer\"]","[\"9:60\"]",Kısa açıklama,tirmizi,Tirmizi 4,İbadet,tr,,2024-07-14
+1005,Nesai,Hac,5,عَنْ عَلِيٍّ ...,Ali'den rivayet edildi...,"[\"hac\"]",hac,Hasen,"[\"Ali\"]","[\"2:196\"]",Kısa açıklama,nesai,Nesai 5,İbadet,tr,,2024-07-14
+1006,Abu Dawud,Abdest,6,عَنْ عُثْمَانَ ...,Osman'dan rivayet edildi...,"[\"abdest\"]",abdest,Sahih,"[\"Osman\"]","[\"5:6\"]",Kısa açıklama,abu-dawud,Abu Dawud 6,İbadet,tr,,2024-07-14
+1007,Musnad Ahmed,İman,7,عَنْ طَلْحَةَ ...,Talha'dan rivayet edildi...,"[\"iman\"]",iman,Hasen,"[\"Talha\"]","[\"2:3\"]",Kısa açıklama,ahmed,Ahmed 7,İnanç,tr,,2024-07-14
+1008,Malik,Müslümanlık,8,عَنْ زَيْدٍ ...,Zeyd'den rivayet edildi...,"[\"iman\"]",iman,Hasen,"[\"Zeyd\"]","[\"2:3\"]",Kısa açıklama,malik,Malik 8,İnanç,tr,,2024-07-14
+1009,Taberani,İhlas,9,عَنْ أَبِي بَكْرٍ ...,Ebu Bekir'den rivayet edildi...,"[\"ihlas\"]",ihlas,Sahih,"[\"Ebu Bekir\"]","[\"112:2\"]",Kısa açıklama,taberani,Taberani 9,İnanç,tr,,2024-07-14
+1010,Bezzar,İhlas,10,عَنْ عَبْدِ اللَّهِ ...,Abdullah'tan rivayet edildi...,"[\"ihlas\"]",ihlas,Hasen,"[\"Abdullah\"]","[\"112:2\"]",Kısa açıklama,bezzar,Bezzar 10,İnanç,tr,,2024-07-14

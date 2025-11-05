@@ -1,0 +1,41 @@
+# Python / FastAPI
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.venv/
+venv/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Data & dumps
+*.sqlite3
+*.db
+*.sql
+database_backup*
+
+# Logs
+*.log
+
+# Node/JS (if any)
+node_modules/
+
+# Flutter / Dart
+islami_app_new/.dart_tool/
+islami_app_new/build/
+islami_app_new/.idea/
+islami_app_new/linux/
+islami_app_new/macos/
+islami_app_new/windows/
+islami_app_new/ios/
+islami_app_new/android/.gradle/
+islami_app_new/android/build/
+
+# IDE
+.idea/
+.vscode/
+
+# Render
+backend/render.yaml

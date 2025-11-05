@@ -1,0 +1,5 @@
+module_id,module_title,module_description,step_order,step_title,step_content,media_url,media_type,source,step_type,language
+1,Siyer-i Nebi,Peygamberimizin hayatı ve örnekliği,1,Doğumu ve Çocukluğu,"Hz. Muhammed'in doğumu, ailesi ve çocukluk dönemi.",https://example.com/image.jpg,image,"Diyanet, Siyer",text,tr
+1,Siyer-i Nebi,Peygamberimizin hayatı ve örnekliği,2,İlk Vahiy,"İlk vahyin gelişi ve Risaletin başlangıcı.",https://example.com/video.mp4,video,"İslam Ansiklopedisi",text,tr
+2,Hac ve Umre,Hac ve Umre ibadetlerinin adım adım anlatımı,1,Hac Nedir?,"Hac ibadetinin anlamı, önemi ve farzları.",,link,"Diyanet",text,tr
+2,Hac ve Umre,Hac ve Umre ibadetlerinin adım adım anlatımı,2,Umre Nedir?,"Umre ibadetinin anlamı ve uygulama adımları.",,,text,tr 
