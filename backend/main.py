@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Any
@@ -1451,4 +1452,9 @@ def safe_json_field(val):
 # Health check endpoint (Render ve izleme için basit sağlık kontrolü)
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(select(1))
+        return {"status": "ok", "db": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "db": "error", "detail": str(e)})
