@@ -171,29 +171,11 @@ class _IslamiAppState extends State<IslamiApp> {
     setState(() {
       _jwtToken = null;
     });
-    // Çıkıştan sonra giriş ekranına kesin geçiş
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => AuthScreen(onLogin: _onLogin)),
-          (route) => false,
-        );
-      }
-    });
   }
 
   void _onLogin(String token) {
     setState(() {
       _jwtToken = token;
-    });
-    // Girişten sonra ana navigasyona kesin geçiş
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => MainNavigation(onLogout: _logout, jwtToken: token)),
-          (route) => false,
-        );
-      }
     });
   }
 
