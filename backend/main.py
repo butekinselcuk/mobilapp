@@ -55,21 +55,25 @@ async def create_tables():
 
 @app.on_event("startup")
 async def on_startup():
-    await create_tables()
-    # Örnek journey modülü ve adımı ekle (sadece hiç modül yoksa)
-    from models import JourneyModule, JourneyStep
-    from database import AsyncSessionLocal
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(JourneyModule))
-        if not result.scalars().first():
-            module = JourneyModule(title="Siyer-i Nebi", description="Peygamberimizin hayatı ve örnekliği", icon="menu_book")
-            session.add(module)
-            await session.commit()
-            await session.refresh(module)
-            step1 = JourneyStep(module_id=module.id, title="Doğumu ve çocukluğu", order=1, content="Peygamberimizin doğumu ve çocukluk dönemi.")
-            step2 = JourneyStep(module_id=module.id, title="Peygamberlik öncesi hayatı", order=2, content="Peygamberlikten önceki hayatı.")
-            session.add_all([step1, step2])
-            await session.commit()
+    # Startup’ta DB’e bağlanma hatalarını yutarak uygulamayı ayakta tut
+    try:
+        await create_tables()
+        # Örnek journey modülü ve adımı ekle (sadece hiç modül yoksa)
+        from models import JourneyModule, JourneyStep
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(JourneyModule))
+            if not result.scalars().first():
+                module = JourneyModule(title="Siyer-i Nebi", description="Peygamberimizin hayatı ve örnekliği", icon="menu_book")
+                session.add(module)
+                await session.commit()
+                await session.refresh(module)
+                step1 = JourneyStep(module_id=module.id, title="Doğumu ve çocukluğu", order=1, content="Peygamberimizin doğumu ve çocukluk dönemi.")
+                step2 = JourneyStep(module_id=module.id, title="Peygamberlik öncesi hayatı", order=2, content="Peygamberlikten önceki hayatı.")
+                session.add_all([step1, step2])
+                await session.commit()
+    except Exception as e:
+        logging.exception("Startup DB işlemleri başarısız. Uygulama çalışmaya devam ediyor.")
 
 # CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
 app.add_middleware(
