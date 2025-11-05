@@ -31,7 +31,16 @@ class _LoginScreenState extends State<LoginScreen> {
       _loading = true;
       _error = null;
     });
+    // API URL’i emin olmak için yükle
+    await dotenv.load(fileName: "assets/.env");
     final apiUrl = dotenv.env['API_URL'] ?? '';
+    if (apiUrl.isEmpty) {
+      setState(() {
+        _loading = false;
+        _error = 'API_URL bulunamadı';
+      });
+      return;
+    }
     final url = Uri.parse('$apiUrl/auth/login');
     final response = await http.post(
       url,
@@ -65,18 +74,10 @@ class _LoginScreenState extends State<LoginScreen> {
             duration: Duration(seconds: 1),
           ),
         );
-        
-        // Callback'i çağır ve kısa bir gecikme sonrası yönlendir
+        // Callback’i deterministik olarak bir kez çağır
         widget.onLoginSuccess(token);
-        
-        // Ana sayfaya yönlendirme için kısa gecikme
-        Future.delayed(Duration(milliseconds: 500), () {
-          if (mounted) {
-            // Force rebuild için callback'i tekrar çağır
-            widget.onLoginSuccess(token);
-          }
-        });
       } else {
+        // mounted değilse bile callback’i tek çağrı olarak ilet
         widget.onLoginSuccess(token);
       }
     } else {
