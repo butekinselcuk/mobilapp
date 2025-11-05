@@ -492,6 +492,7 @@ async def get_user_history(
             q = q.where(UserQuestionHistory.answer.ilike(f"%{category}%"))
         if source:
             q = q.where(UserQuestionHistory.answer.ilike(f"%{source}%"))
+            
         if date_from:
             q = q.where(UserQuestionHistory.created_at >= date_from)
         if date_to:
@@ -530,7 +531,7 @@ async def get_user_favorites(
     async with AsyncSessionLocal() as session:
         q = select(UserFavoriteHadith).options(selectinload(UserFavoriteHadith.hadith)).where(UserFavoriteHadith.user_id == resolved_user_id)
         if search:
-            q = q.where(or_(UserFavoriteHadith.hadith.has(Hadith.text.ilike(f"%{search}%")), UserFavoriteHadith.hadith.has(Hadith.source.ilike(f"%{search}%")), UserFavoriteHadith.hadith.has(Hadith.reference.ilike(f"%{search}%"))))
+            q = q.where(or_(UserFavoriteHadith.hadith.has(Hadith.text.ilike(f"%{search}%")), UserFavoriteHadith.hadith.has(Hadith.source.ilike(f"%{source}%")), UserFavoriteHadith.hadith.has(Hadith.reference.ilike(f"%{reference}%"))))
         if category:
             q = q.where(UserFavoriteHadith.hadith.has(Hadith.category.ilike(f"%{category}%")))
         if source:
@@ -1442,6 +1443,7 @@ async def get_user_profile(current_user: User = Depends(get_current_user)):
         "premium_expiry": current_user.premium_expiry.isoformat() if current_user.premium_expiry else None
     }
 
+
 def safe_json_field(val):
     if val is None or val == "" or val == []:
         return ""
@@ -1458,3 +1460,54 @@ async def health():
         return {"status": "ok", "db": "ok"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "db": "error", "detail": str(e)})
+# -------------------------
+# Yakın Camiler & Rota API
+# -------------------------
+
+def _google_api_key() -> str:
+    key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    if not key:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY ortam değişkeni set edilmemiş")
+    return key
+
+@app.get("/api/mosques/nearby")
+def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: float = Query(3.0, description="km cinsinden")):
+    """Google Places 'nearbysearch' ile camileri döndürür (sunucu tarafı proxy)."""
+    api_key = _google_api_key()
+    radius_m = int(radius * 1000)
+    url = (
+        f"https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        f"?location={lat},{lng}&radius={radius_m}&type=mosque&key={api_key}"
+    )
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    data = r.json()
+    results = data.get("results", [])
+    # Frontend'in Mosque.fromBackendJson formatına map et
+    mosques = []
+    for item in results:
+        geom = item.get("geometry", {}).get("location", {})
+        mosques.append({
+            "id": item.get("place_id") or item.get("id") or "",
+            "name": item.get("name", "Cami"),
+            "latitude": float(geom.get("lat", 0.0)),
+            "longitude": float(geom.get("lng", 0.0)),
+            "address": item.get("vicinity") or item.get("formatted_address"),
+            "rating": (item.get("rating") or None),
+            "photo_reference": (item.get("photos", [{}])[0].get("photo_reference") if item.get("photos") else None),
+        })
+    return mosques
+
+@app.get("/api/directions")
+def directions(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float, mode: str = "driving"):
+    """Google Directions ile rota bilgisini döndürür (sunucu tarafı proxy)."""
+    api_key = _google_api_key()
+    url = (
+        f"https://maps.googleapis.com/maps/api/directions/json"
+        f"?origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&mode={mode}&key={api_key}"
+    )
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
