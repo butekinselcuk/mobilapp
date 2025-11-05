@@ -25,5 +25,6 @@ services:
 
 databases:
   - name: islami-app-db
-    plan: starter
+    plan: basic-1gb
+    diskSizeGB: 10
     region: oregon
