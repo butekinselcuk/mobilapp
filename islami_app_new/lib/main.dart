@@ -171,12 +171,29 @@ class _IslamiAppState extends State<IslamiApp> {
     setState(() {
       _jwtToken = null;
     });
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (_) => AuthScreen(onLogin: _onLogin),
+      ),
+      (route) => false,
+    );
   }
 
   void _onLogin(String token) {
     setState(() {
       _jwtToken = token;
     });
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (_) => MainNavigation(
+          onLogout: _logout,
+          jwtToken: _jwtToken!,
+        ),
+      ),
+      (route) => false,
+    );
   }
 
   @override
