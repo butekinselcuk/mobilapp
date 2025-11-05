@@ -4,7 +4,7 @@ from database import AsyncSessionLocal
 from models import Hadith
 from embedding_utils import generate_embedding
 from sqlalchemy import select, or_
-import numpy as np
+import math
 import json
 
 def simple_distance(a: str, b: str) -> int:
@@ -12,11 +12,19 @@ def simple_distance(a: str, b: str) -> int:
     return abs(int(a) - int(b))
 
 def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+    # Numpy olmadan kosinüs benzerliği
+    if not a or not b:
         return 0.0
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    # Farklı uzunluklarda ise eşleşen kısmı kullan
+    length = min(len(a), len(b))
+    if length == 0:
+        return 0.0
+    dot = sum(a[i] * b[i] for i in range(length))
+    norm_a = math.sqrt(sum(x * x for x in a[:length]))
+    norm_b = math.sqrt(sum(x * x for x in b[:length]))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
 
 async def search_hadiths(query: str, top_k: int = 3):
     query_emb = generate_embedding(query)
@@ -26,16 +34,11 @@ async def search_hadiths(query: str, top_k: int = 3):
         hadiths = (await session.execute(select(Hadith).where(Hadith.embedding != None))).scalars().all()
     if not hadiths:
         return []
-    # Vektör benzerliği (cosine similarity)
-    def cosine_sim(a, b):
-        a = np.array(a)
-        b = np.array(b)
-        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
     scored = []
     for h in hadiths:
         try:
             emb = [float(x) for x in h.embedding.split(",") if x.strip()]
-            sim = cosine_sim(query_emb, emb)
+            sim = cosine_similarity(query_emb, emb)
             scored.append((sim, h))
         except Exception:
             continue
@@ -50,4 +53,4 @@ if __name__ == "__main__":
     query = sys.argv[1]
     results = asyncio.run(search_hadiths(query))
     for h in results:
-        print(f"Hadis: {h.text}\nKaynak: {h.source}\n---") 
+        print(f"Hadis: {h.text}\nKaynak: {h.source}\n---")
