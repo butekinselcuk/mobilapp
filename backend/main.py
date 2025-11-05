@@ -1443,3 +1443,8 @@ def safe_json_field(val):
     if isinstance(val, list):
         return json.dumps(val, ensure_ascii=False)
     return str(val)
+
+# Health check endpoint (Render ve izleme için basit sağlık kontrolü)
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
