@@ -42,10 +42,11 @@ def run_alembic_upgrade_head():
     command.upgrade(alembic_cfg, "head")
 
 
-async def _seed_hadiths_if_empty():
+async def _seed_hadiths_if_empty(force: bool = False):
+    """Hadisleri seed eder. force=True ise mevcut sayıya bakmadan JSON importu dener."""
     async with AsyncSessionLocal() as session:
         total = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
-        if total and total >= 100:
+        if not force and total and total >= 100:
             print(f"Seed atlandı: mevcut hadis sayısı = {total}")
             return False
 
@@ -56,13 +57,13 @@ async def _seed_hadiths_if_empty():
 
         # Önce JSON importu dene (tercih edilen)
         if os.path.exists(tr_path) and os.path.exists(ar_path) and os.path.exists(en_path):
-            print("JSON hadis importu başlıyor...")
+            print("JSON hadis importu başlıyor..." + (" (force)" if force else ""))
             try:
                 await import_hadiths_json(tr_path, ar_path, en_path)
                 # Import sonrası toplamı tekrar kontrol et
                 total_after = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
                 print(f"JSON import tamamlandı, yeni toplam = {total_after}")
-                return total_after > total
+                return total_after > total or force
             except Exception as e:
                 print("JSON import hatası, CSV’ye düşülüyor:", e)
 
@@ -105,13 +106,16 @@ async def run():
     # Migration (senkron Alembic çağrısı)
     run_alembic_upgrade_head()
 
+    # FORCE davranışı: ortamdan oku
+    force_flag = os.getenv("FORCE_JSON_IMPORT", "false").strip().lower() in {"1", "true", "yes"}
+
     # Seed ve embedding
     async with AsyncSessionLocal() as session:
-        if await _is_init_already_done(session):
+        if not force_flag and await _is_init_already_done(session):
             print("Init zaten tamamlanmış. Atlanıyor.")
             return
 
-        seeded = await _seed_hadiths_if_empty()
+        seeded = await _seed_hadiths_if_empty(force=force_flag)
 
         # Embedding güncellemesi: Önce OpenAI, yoksa Gemini (embedding_utils içinde)
         try:
@@ -119,6 +123,7 @@ async def run():
         except Exception as e:
             print("Embedding güncelleme sırasında hata:", e)
 
+        # Force olsa da init işaretini güncelle
         await _mark_init_done(session)
 
 

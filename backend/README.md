@@ -1,1 +1,14 @@
-Bu commit ile embedding üretimi OpenAI öncelikli olacak şekilde güncellendi; OpenAI anahtarı yoksa Gemini’ye otomatik düşer.\nAyrıca migrate+seed akışı JSON dosyalarından (hadiths_tr/en/ar.json) import etmeyi deneyecek, başarısız olursa CSV örneğine geri dönecektir.\nRender servisinde auto-deploy açık olduğu için push sonrasında otomatik yayınlanacaktır.
+# Backend Scripts
+
+Bu servis başlangıcında `migrate_and_seed` otomatik çalışır. Artık `FORCE_JSON_IMPORT=true` ortam değişkeniyle 3 dilli JSON hadis importu üretim ortamında yeniden tetiklenebilir.
+
+- JSON dosyaları: `hadiths_tr.json`, `hadiths_ar.json`, `hadiths_en.json`
+- Import sonrası embedding güncellemesi otomatik çalışır.
+
+Kullanım (Render ortam değişkeni):
+
+```
+FORCE_JSON_IMPORT=true
+```
+
+Not: Import scripti mevcut kayıtları `hadis_id + language` eşleşmesiyle atlar, tekrarlı kayıt oluşturmaz.
