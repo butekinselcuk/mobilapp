@@ -5,7 +5,7 @@ from typing import List, Dict, Tuple
 # Proje içi modüller
 from vector_search import search_hadiths
 try:
-from ai_models.hadis_model import hadis_ai_model
+    from ai_models.hadis_model import hadis_ai_model
     _HADIS_AI_AVAILABLE = True
 except Exception:
     _HADIS_AI_AVAILABLE = False
