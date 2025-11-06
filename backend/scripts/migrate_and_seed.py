@@ -15,9 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import AsyncSessionLocal
 from models import Hadith, Setting
 from embedding_utils import update_hadith_embeddings
-# Not: Render ortamında çalışma dizini ve PYTHONPATH farklı olabildiği için
-# modul çözümlemesini daha sağlam yapmak adına paket yolu ile import ediyoruz.
-from backend.import_hadiths import import_hadiths as import_hadiths_json
+# Not: import_hadiths modülü her ortamda bulunmayabilir. Üst düzeyde
+# import etmek yerine, JSON dosyaları mevcutsa fonksiyon içinde deniyoruz.
 
 
 def _build_sync_db_url_from_env() -> Optional[str]:
@@ -61,6 +60,8 @@ async def _seed_hadiths_if_empty(force: bool = False):
         if os.path.exists(tr_path) and os.path.exists(ar_path) and os.path.exists(en_path):
             print("JSON hadis importu başlıyor..." + (" (force)" if force else ""))
             try:
+                # Dinamik import: modül yoksa CSV’ye düşeceğiz
+                from import_hadiths import import_hadiths as import_hadiths_json
                 await import_hadiths_json(tr_path, ar_path, en_path)
                 # Import sonrası toplamı tekrar kontrol et
                 total_after = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
