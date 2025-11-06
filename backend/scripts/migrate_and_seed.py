@@ -12,10 +12,10 @@ from alembic import command
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.database import AsyncSessionLocal
-from backend.models import Hadith, Setting
-from backend.embedding_utils import update_hadith_embeddings
-from backend.import_hadiths import import_hadiths as import_hadiths_json
+from database import AsyncSessionLocal
+from models import Hadith, Setting
+from embedding_utils import update_hadith_embeddings
+from import_hadiths import import_hadiths as import_hadiths_json
 
 
 def _build_sync_db_url_from_env() -> Optional[str]:
@@ -24,7 +24,7 @@ def _build_sync_db_url_from_env() -> Optional[str]:
         return None
     # postgres:// → postgresql://
     if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
+        url = "postgresql://" + url[len("postgres://") :]
     # postgresql+asyncpg:// → postgresql://
     if "+asyncpg" in url:
         url = url.replace("postgresql+asyncpg://", "postgresql://")
