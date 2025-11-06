@@ -33,6 +33,7 @@ import json
 import httpx
 from textwrap import shorten
 import uuid
+from scripts.migrate_and_seed import run as migrate_and_seed_run
 
 # Hadis AI Model import
 try:
@@ -75,6 +76,11 @@ async def on_startup():
                 await session.commit()
     except Exception as e:
         logging.exception("Startup DB işlemleri başarısız. Uygulama çalışmaya devam ediyor.")
+    # Migration + seed işlemlerini arka planda tek seferlik tetikle
+    try:
+        asyncio.create_task(migrate_and_seed_run())
+    except Exception:
+        logging.exception("Startup migrate+seed arka plan görevi başlatılamadı")
 
 # CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
 app.add_middleware(
@@ -121,6 +127,12 @@ class ChatResponse(BaseModel):
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_URL = os.getenv("GEMINI_URL")
 
+# Ultimate RAG entegrasyonu (OpenAI/Claude tercihleriyle)
+from ultimate_rag_main import (
+    search_hadiths_ultimate,
+    generate_ai_response_with_fallback,
+)
+
 @app.post("/api/ask", response_model=AskResponse)
 async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_user)):
     import logging
@@ -144,87 +156,32 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             count = result.scalar()
             if count >= daily_limit:
                 raise HTTPException(status_code=429, detail=limit_message)
-    # --- Vektör arama ile en yakın hadisleri bul ---
-    hadith_results = await search_hadiths(request.question, top_k=3)
-    if not hadith_results:
-        answer = "Bu konuda güvenilir hadis kaynağı bulunamadı."
-        sources = []
-        if user_id is not None:
-            from database import AsyncSessionLocal
-            from models import UserQuestionHistory
-            try:
-                async with AsyncSessionLocal() as session:
-                    history = UserQuestionHistory(user_id=user_id, question=request.question, answer=answer, hadith_id=None)
-                    session.add(history)
-                    await session.commit()
-            except Exception as e:
-                logging.exception("Geçmiş kaydı HATASI", exc_info=True)
-        return AskResponse(answer=answer, sources=sources)
-    
-    # --- Hibrit AI Mantığı: Fine-tuned model önce dene ---
-    ai_source = "gemini"  # Varsayılan kaynak
-    confidence_score = 0.0
-    
-    if HADIS_AI_AVAILABLE and hadis_ai_model:
-        try:
-            # Hadis bağlamını hazırla
-            hadith_context = "\n".join([
-                f"Kaynak: {h.source} | Referans: {h.reference} | Metin: {shorten(h.turkish_text, 300)}" for h in hadith_results
-            ])
-            
-            # Fine-tuned model ile cevap üret
-            ai_response = hadis_ai_model.generate_response(request.question, hadith_context)
-            answer = ai_response["answer"]
-            confidence_score = ai_response["confidence"]
-            
-            # Güven skoru yeterli ise fine-tuned model cevabını kullan
-            if confidence_score >= 0.7:
-                ai_source = "hadis_ai"
-                logging.info(f"Fine-tuned model kullanıldı. Güven skoru: {confidence_score}")
-            else:
-                # Güven skoru düşükse Gemini'ye geri dön
-                logging.info(f"Güven skoru düşük ({confidence_score}), Gemini'ye geri dönülüyor")
-                confidence_score = 0.0  # Gemini kullanımını zorla
-        except Exception as e:
-            logging.exception("Fine-tuned model hatası, Gemini'ye geri dönülüyor", exc_info=True)
-            confidence_score = 0.0  # Gemini kullanımını zorla
-    
-    # Gemini kullanımı (geri dönüş veya model yoksa)
-    if not HADIS_AI_AVAILABLE or confidence_score < 0.7:
-        # Sistem promptunu sadeleştir
-        system_prompt = (
-            "Sen, İslami App'in yapay zeka asistanısın. "
-            "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
-            "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme. "
-            "Soruyu anlamazsan kullanıcıdan daha açık sormasını iste."
+    # --- Ultimate RAG: vektör arama ve akıllı fallback yanıt üretimi ---
+    hadith_dicts = search_hadiths_ultimate(request.question, top_k=3)
+    answer, used_fallback, response_type = generate_ai_response_with_fallback(
+        request.question,
+        hadith_dicts,
+        True
+    )
+    # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
+    if not hadith_dicts:
+        answer = await get_setting(
+            'ai_no_hadith_message',
+            'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
         )
-        # Hadisleri prompta kaynak olarak ekle (truncate for token safety)
-        hadith_texts = "\n".join([
-            f"Kaynak: {h.source} | Referans: {h.reference} | Metin: {shorten(h.turkish_text, 300)}" for h in hadith_results
-        ])
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": request.question},
-            {"role": "system", "content": f"İlgili hadisler:\n{hadith_texts}"}
-        ]
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    GEMINI_URL,
-                    headers={"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY},
-                    json={"contents": [{"parts": [{"text": m["content"]} for m in messages]}]}
-                )
-            r.raise_for_status()
-            gemini_data = r.json()
-            answer = gemini_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Cevap alınamadı.")
-            ai_source = "gemini"
-        except httpx.HTTPStatusError as e:
-            logging.exception("Gemini API HTTP error", exc_info=True)
-            answer = "Üzgünüm, şu anda yanıt üretilemiyor. Lütfen daha sonra tekrar deneyin."
-        except Exception as e:
-            logging.exception("Gemini API error", exc_info=True)
-            answer = "Üzgünüm, şu anda yanıt üretilemiyor. Lütfen daha sonra tekrar deneyin."
+    # Kaynakları hazırla (UI için sade gösterim)
+    sources = []
+    for h in hadith_dicts:
+        display = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
+        sources.append(SourceItem(type="hadis", name=display))
+    ai_source = "ultimate_rag"
     # Gelişmiş kaynaklar kutusu mantığı
+    system_prompt = (
+        "Sen, İslami App'in yapay zeka asistanısın. "
+        "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
+        "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme. "
+        "Soruyu anlamazsan kullanıcıdan daha açık sormasını iste."
+    )
     GENERIC_ANSWERS = [
         "sorunuzu daha açık yazar mısınız",
         "daha detaylı bir soru sormanız gerekmektedir",
@@ -236,20 +193,20 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
     answer_lower = answer.lower()
     if any(x in answer_lower for x in GENERIC_ANSWERS):
         sources = []
+    elif not hadith_dicts:
+        # Hadis bulunamadıysa herhangi bir kaynak etiketi gösterme
+        sources = []
     else:
-        # Sadece AI cevabında SQL'den dönen hadislerin metni veya referansı geçiyorsa kaynaklar kutusunda göster
+        # AI cevabında dönen hadislerin metni veya referansı geçiyorsa kaynakları göster
         filtered_sources = []
-        for h in hadith_results:
-            if (h.turkish_text and h.turkish_text[:40].lower() in answer_lower) or (h.reference and h.reference.lower() in answer_lower):
-                filtered_sources.append(SourceItem(type="hadis", name=f"{h.source} - {h.reference} - {shorten(h.turkish_text, 60)}"))
-        
-        # AI kaynak takibi ekle
-        if ai_source == "hadis_ai":
-            filtered_sources.append(SourceItem(type="ai", name=f"Hadis AI (Güven: {confidence_score:.1f})"))
-        elif ai_source == "gemini":
-            filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
-        
-        sources = filtered_sources if filtered_sources else []
+        for h in hadith_dicts:
+            h_text = (h.get('text') or '')
+            h_ref = (h.get('reference') or '')
+            if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
+                filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
+        # AI kaynak etiketi
+        filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
+        sources = filtered_sources if filtered_sources else sources
     # --- Sistem promptunun aynısını döndürmeyi engelle ---
     system_prompt_start = system_prompt[:80].lower()
     # Kısa/tek kelime sorularda kullanıcıyı yönlendir
@@ -279,11 +236,9 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
         try:
             async with AsyncSessionLocal() as session:
                 hadith_id = None
-                first = hadith_results[0]
-                if hasattr(first, 'id'):
-                    hadith_id = first.id
-                elif isinstance(first, dict) and 'id' in first:
-                    hadith_id = first['id']
+                if hadith_dicts:
+                    first = hadith_dicts[0]
+                    hadith_id = first.get('id')
                 history = UserQuestionHistory(user_id=user_id, question=request.question, answer=answer, hadith_id=hadith_id)
                 session.add(history)
                 await session.commit()
@@ -373,42 +328,49 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
     if current_user:
         response = await ask_ai(ask_request, current_user)
     else:
-        # Anonim kullanıcı için basit işlem
-        hadith_results = await search_hadiths(request.question, top_k=3)
-        if not hadith_results:
-            answer = "Bu konuda güvenilir hadis kaynağı bulunamadı."
+        # Anonim kullanıcı için Ultimate RAG + akıllı fallback
+        hadith_dicts = search_hadiths_ultimate(request.question, top_k=3)
+        answer, used_fallback, response_type = generate_ai_response_with_fallback(
+            request.question,
+            hadith_dicts,
+            True
+        )
+        # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
+        if not hadith_dicts:
+            answer = await get_setting(
+                'ai_no_hadith_message',
+                'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
+            )
+        # Kaynakları hazırla (UI için sade gösterim)
+        sources = []
+        for h in hadith_dicts:
+            display = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
+            sources.append(SourceItem(type="hadis", name=display))
+
+        # Gelişmiş kaynaklar kutusu mantığı (ask_ai ile uyumlu)
+        GENERIC_ANSWERS = [
+            "sorunuzu daha açık yazar mısınız",
+            "daha detaylı bir soru sormanız gerekmektedir",
+            "yardımcı olabilmem için belirtir misiniz"
+        ]
+        answer_lower = answer.lower()
+        if any(x in answer_lower for x in GENERIC_ANSWERS):
+            sources = []
+        elif not hadith_dicts:
+            # Hadis bulunamadıysa herhangi bir kaynak etiketi gösterme
             sources = []
         else:
-            # Basit Gemini çağrısı
-            system_prompt = (
-                "Sen, İslami App'in yapay zeka asistanısın. "
-                "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
-                "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
-            )
-            hadith_texts = "\n".join([
-                f"Kaynak: {h.source} | Referans: {h.reference} | Metin: {shorten(h.turkish_text, 300)}" for h in hadith_results
-            ])
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.question},
-                {"role": "system", "content": f"İlgili hadisler:\n{hadith_texts}"}
-            ]
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(
-                        GEMINI_URL,
-                        headers={"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY},
-                        json={"contents": [{"parts": [{"text": m["content"]} for m in messages]}]}
-                    )
-                r.raise_for_status()
-                gemini_data = r.json()
-                answer = gemini_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Cevap alınamadı.")
-                sources = [SourceItem(type="ai", name="AI Asistan")]
-            except Exception as e:
-                logging.exception("Gemini API error", exc_info=True)
-                answer = "Üzgünüm, şu anda yanıt üretilemiyor. Lütfen daha sonra tekrar deneyin."
-                sources = []
-        
+            # AI cevabında dönen hadislerin metni veya referansı geçiyorsa kaynakları göster
+            filtered_sources = []
+            for h in hadith_dicts:
+                h_text = (h.get('text') or '')
+                h_ref = (h.get('reference') or '')
+                if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
+                    filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
+            # AI kaynak etiketi
+            filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
+            sources = filtered_sources if filtered_sources else sources
+
         response = AskResponse(answer=answer, sources=sources)
     
     # Session'a mesajları kaydet
