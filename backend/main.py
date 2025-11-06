@@ -157,7 +157,7 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             if count >= daily_limit:
                 raise HTTPException(status_code=429, detail=limit_message)
     # --- Ultimate RAG: vektör arama ve akıllı fallback yanıt üretimi ---
-    hadith_dicts = search_hadiths_ultimate(request.question, top_k=3)
+    hadith_dicts = await search_hadiths_ultimate(request.question, top_k=3)
     answer, used_fallback, response_type = generate_ai_response_with_fallback(
         request.question,
         hadith_dicts,
@@ -329,7 +329,7 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
         response = await ask_ai(ask_request, current_user)
     else:
         # Anonim kullanıcı için Ultimate RAG + akıllı fallback
-        hadith_dicts = search_hadiths_ultimate(request.question, top_k=3)
+        hadith_dicts = await search_hadiths_ultimate(request.question, top_k=3)
         answer, used_fallback, response_type = generate_ai_response_with_fallback(
             request.question,
             hadith_dicts,
