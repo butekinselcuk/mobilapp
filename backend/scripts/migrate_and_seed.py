@@ -15,7 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import AsyncSessionLocal
 from models import Hadith, Setting
 from embedding_utils import update_hadith_embeddings
-from import_hadiths import import_hadiths as import_hadiths_json
+# Not: Render ortamında çalışma dizini ve PYTHONPATH farklı olabildiği için
+# modul çözümlemesini daha sağlam yapmak adına paket yolu ile import ediyoruz.
+from backend.import_hadiths import import_hadiths as import_hadiths_json
 
 
 def _build_sync_db_url_from_env() -> Optional[str]:
