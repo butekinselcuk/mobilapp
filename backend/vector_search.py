@@ -30,20 +30,41 @@ async def search_hadiths(query: str, top_k: int = 3):
     query_emb = generate_embedding(query)
     if isinstance(query_emb, str):
         query_emb = [float(x) for x in query_emb.split(",") if x.strip()]
+
     async with AsyncSessionLocal() as session:
-        hadiths = (await session.execute(select(Hadith).where(Hadith.embedding != None))).scalars().all()
-    if not hadiths:
-        return []
-    scored = []
-    for h in hadiths:
-        try:
-            emb = [float(x) for x in h.embedding.split(",") if x.strip()]
-            sim = cosine_similarity(query_emb, emb)
-            scored.append((sim, h))
-        except Exception:
-            continue
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return [h for _, h in scored[:top_k]]
+        # Geçerli embedding’i olanları al (None veya boş olmayanlar)
+        hadiths_with_emb = (await session.execute(
+            select(Hadith).where((Hadith.embedding != None) & (Hadith.embedding != ""))
+        )).scalars().all()
+
+        # Embedding’ler ve sorgu embedding’i varsa vektör benzerliği kullan
+        if hadiths_with_emb and query_emb:
+            scored = []
+            for h in hadiths_with_emb:
+                try:
+                    emb = [float(x) for x in h.embedding.split(",") if x.strip()]
+                    sim = cosine_similarity(query_emb, emb)
+                    scored.append((sim, h))
+                except Exception:
+                    continue
+            if scored:
+                scored.sort(reverse=True, key=lambda x: x[0])
+                return [h for _, h in scored[:top_k]]
+
+        # Aksi halde basit metin eşleşmesi ile geri dönüş
+        like = f"%{query}%"
+        fallback = (await session.execute(
+            select(Hadith).where(
+                or_(
+                    Hadith.turkish_text.ilike(like),
+                    Hadith.source.ilike(like),
+                    Hadith.reference.ilike(like),
+                    Hadith.kitap.ilike(like),
+                    Hadith.bab.ilike(like),
+                )
+            ).limit(top_k)
+        )).scalars().all()
+        return fallback
 
 if __name__ == "__main__":
     import sys
@@ -53,4 +74,4 @@ if __name__ == "__main__":
     query = sys.argv[1]
     results = asyncio.run(search_hadiths(query))
     for h in results:
-        print(f"Hadis: {h.text}\nKaynak: {h.source}\n---")
+        print(f"Hadis: {getattr(h, 'turkish_text', getattr(h, 'text', ''))}\nKaynak: {getattr(h, 'source', '')}\n---")
