@@ -70,20 +70,25 @@ def generate_embedding(text: str):
         return emb
     return _generate_gemini_embedding(text)
 
-async def update_hadith_embeddings():
+async def update_hadith_embeddings() -> int:
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Hadith).where((Hadith.embedding == None) | (Hadith.embedding == ''))
         )
         hadiths = result.scalars().all()
+        updated = 0
         for hadith in hadiths:
             # Yeni şemada embedding için turkish_text kullanılmalı
             text = hadith.turkish_text or ''
+            if not text:
+                continue
             emb = generate_embedding(text)
             hadith.embedding = emb if emb is not None else ''
             session.add(hadith)
+            updated += 1
         await session.commit()
-        print(f"{len(hadiths)} hadisin embeddingi güncellendi.")
+        print(f"{updated} hadisin embeddingi güncellendi.")
+        return updated
 
 if __name__ == "__main__":
     asyncio.run(update_hadith_embeddings())
