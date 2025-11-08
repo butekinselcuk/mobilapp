@@ -53,11 +53,12 @@ async def search_hadiths(query: str, top_k: int = 3):
 
         # Aksi halde basit metin eşleşmesi ile geri dönüş
         like = f"%{query}%"
-        # Minimal şema uyumluluğu: sadece her iki şemada da bulunan alanları kullan
+        # Hadis şemasına uygun: Türkçe veya Arapça metin; ek olarak kaynak ve referans
         fallback = (await session.execute(
             select(Hadith).where(
                 or_(
-                    Hadith.text.ilike(like),
+                    Hadith.turkish_text.ilike(like),
+                    Hadith.arabic_text.ilike(like),
                     Hadith.source.ilike(like),
                     Hadith.reference.ilike(like),
                 )
@@ -73,4 +74,4 @@ if __name__ == "__main__":
     query = sys.argv[1]
     results = asyncio.run(search_hadiths(query))
     for h in results:
-        print(f"Hadis: {getattr(h, 'turkish_text', getattr(h, 'text', ''))}\nKaynak: {getattr(h, 'source', '')}\n---")
+        print(f"Hadis: {getattr(h, 'turkish_text', getattr(h, 'arabic_text', ''))}\nKaynak: {getattr(h, 'source', '')}\n---")
