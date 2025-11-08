@@ -227,7 +227,8 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
     if not current_user.is_premium:
         from database import AsyncSessionLocal
         from models import UserQuestionHistory
-        daily_limit_raw = await get_setting('ai_daily_limit', '1')
+        # Varsayılan limit UI ile uyumlu olacak şekilde 3
+        daily_limit_raw = await get_setting('ai_daily_limit', '3')
         try:
             daily_limit = int(str(daily_limit_raw))
         except Exception:
