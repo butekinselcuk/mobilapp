@@ -51,20 +51,43 @@ async def search_hadiths(query: str, top_k: int = 3):
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [h for _, h in scored[:top_k]]
 
-        # Aksi halde basit metin eşleşmesi ile geri dönüş
+        # Aksi halde basit metin eşleşmesi ile geri dönüş (güvenli çok aşamalı fallback)
         like = f"%{query}%"
-        # Hadis şemasına uygun: Türkçe veya Arapça metin; ek olarak kaynak ve referans
-        fallback = (await session.execute(
-            select(Hadith).where(
-                or_(
-                    Hadith.turkish_text.ilike(like),
-                    Hadith.arabic_text.ilike(like),
-                    Hadith.source.ilike(like),
-                    Hadith.reference.ilike(like),
-                )
-            ).limit(top_k)
-        )).scalars().all()
-        return fallback
+        
+        # 1) Tercih edilen sütunlar: turkish_text, english_text, arabic_text
+        # 2) Minimal şema: text
+        # Tüm denemeleri try/except ile sarmalayarak, sütun eksikliği gibi hatalarda
+        # bir sonraki stratejiye düşüyoruz.
+        def try_query(columns):
+            conditions = [getattr(Hadith, c).ilike(like) for c in columns if hasattr(Hadith, c)]
+            # Her zaman mevcut olduğunu bildiğimiz destekleyici alanlar
+            conditions.extend([Hadith.source.ilike(like), Hadith.reference.ilike(like)])
+            q = select(Hadith).where(or_(*conditions)).limit(top_k)
+            return q
+
+        # Deneme sırası: zengin metin alanları → minimal text → sadece source/reference
+        for cols in (["turkish_text", "english_text", "arabic_text"], ["text"]):
+            try:
+                result = await session.execute(try_query(cols))
+                rows = result.scalars().all()
+                if rows:
+                    return rows
+            except Exception:
+                # Bu strateji başarısızsa bir sonrakine geç
+                pass
+
+        # Son çare: sadece source/reference üzerinde arama
+        try:
+            result = await session.execute(
+                select(Hadith).where(
+                    or_(Hadith.source.ilike(like), Hadith.reference.ilike(like))
+                ).limit(top_k)
+            )
+            rows = result.scalars().all()
+            return rows
+        except Exception:
+            # Hiçbiri çalışmazsa boş döndür
+            return []
 
 if __name__ == "__main__":
     import sys
@@ -74,4 +97,4 @@ if __name__ == "__main__":
     query = sys.argv[1]
     results = asyncio.run(search_hadiths(query))
     for h in results:
-        print(f"Hadis: {getattr(h, 'turkish_text', getattr(h, 'arabic_text', ''))}\nKaynak: {getattr(h, 'source', '')}\n---")
+        print(f"Hadis: {h.text}\nKaynak: {h.source}\n---")

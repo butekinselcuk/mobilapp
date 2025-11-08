@@ -8,13 +8,14 @@ import models
 from dotenv import load_dotenv
 import os
 import requests
+import urllib.parse
 import asyncio
 from auth import router as auth_router
 from fastapi import Query, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import AsyncSessionLocal
 from models import User, UserQuestionHistory, UserFavoriteHadith, Hadith, Setting, ChatSession, ChatMessage
-from sqlalchemy import select
+from sqlalchemy import select, text
 from vector_search import search_hadiths
 import logging
 from auth import get_current_user
@@ -34,6 +35,7 @@ import httpx
 from textwrap import shorten
 import uuid
 from scripts.migrate_and_seed import run as migrate_and_seed_run
+from math import radians, degrees, sin, cos, atan2
 
 # Hadis AI Model import
 try:
@@ -60,6 +62,66 @@ async def on_startup():
     # Startup’ta DB’e bağlanma hatalarını yutarak uygulamayı ayakta tut
     try:
         await create_tables()
+        # Sequence onarımı: tabloların id sequence değerlerini MAX(id) ile senkronize et
+        try:
+            async with engine.begin() as conn:
+                tables = [
+                    ("chat_messages", "id"),
+                    ("chat_sessions", "id"),
+                    ("user_question_history", "id"),
+                ]
+                for tbl, col in tables:
+                    # Mevcut en büyük id’yi al
+                    max_res = await conn.execute(text(f"SELECT COALESCE(MAX({col}), 0) FROM {tbl}"))
+                    max_id = max_res.scalar() or 0
+
+                    # İlgili sequence adını al (varsa)
+                    seq_res = await conn.execute(
+                        text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=tbl, col=col)
+                    )
+                    seq_name = seq_res.scalar()
+
+                    if not seq_name:
+                        # Kolon default’u üzerinden sequence var mı diye bak
+                        default_res = await conn.execute(text(
+                            """
+                            SELECT column_default
+                            FROM information_schema.columns
+                            WHERE table_name = :tbl AND column_name = :col
+                            """
+                        ).bindparams(tbl=tbl, col=col))
+                        column_default = default_res.scalar()
+                        if column_default and 'nextval' in column_default:
+                            # nextval('schema.seq'::regclass) ifadesinden sequence adını çıkarma denemesi
+                            try:
+                                start = column_default.find("'")
+                                end = column_default.find("'", start + 1)
+                                inferred_seq = column_default[start+1:end]
+                                seq_name = inferred_seq
+                                print(f"[SEQ-FIX] {tbl}.{col} için default üzerinden sequence bulundu: {seq_name}")
+                            except Exception:
+                                seq_name = None
+                        
+                    if not seq_name:
+                        # Sequence yoksa güvenli bir şekilde oluştur ve default’u ayarla
+                        fallback_seq = f"{tbl}_{col}_seq"
+                        print(f"[SEQ-FIX] {tbl}.{col} için sequence bulunamadı. Oluşturuluyor: {fallback_seq}")
+                        await conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
+                        await conn.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {tbl}.{col}"))
+                        await conn.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
+                        seq_name = fallback_seq
+
+                    if max_id == 0:
+                        print(f"[SEQ-FIX] {tbl}.{col} tablosu boş (max_id=0), sequence değiştirilmeyecek: {seq_name}")
+                        continue
+
+                    # Sequence’i MAX(id) değerine ayarla (TRUE → nextval max_id+1 döner)
+                    await conn.execute(
+                        text("SELECT setval(:seq::regclass, :newval, TRUE)").bindparams(seq=seq_name, newval=max_id)
+                    )
+                    print(f"[SEQ-FIX] {tbl}.{col} için {seq_name} setval({max_id}, TRUE) uygulandı.")
+        except Exception:
+            print("[SEQ-FIX] Sequence onarımı başarısız, uygulama başlamaya devam ediyor.")
         # Örnek journey modülü ve adımı ekle (sadece hiç modül yoksa)
         from models import JourneyModule, JourneyStep
         from database import AsyncSessionLocal
@@ -182,31 +244,20 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
         "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme. "
         "Soruyu anlamazsan kullanıcıdan daha açık sormasını iste."
     )
-    GENERIC_ANSWERS = [
-        "sorunuzu daha açık yazar mısınız",
-        "daha detaylı bir soru sormanız gerekmektedir",
-        "yardımcı olabilmem için belirtir misiniz",
-        "örnek olarak",
-        "kaynak: muteber fıkıh kaynakları",
-        "daha alakalı hadisler için sorunuzu netleştirmeniz gerekmektedir"
-    ]
+    # Kaynakları her zaman göster: hadis bulunduysa listeyi koru,
+    # eşleşme tespit edilirse öncelikli olarak filtrelenmiş listeyi kullan.
     answer_lower = answer.lower()
-    if any(x in answer_lower for x in GENERIC_ANSWERS):
-        sources = []
-    elif not hadith_dicts:
-        # Hadis bulunamadıysa herhangi bir kaynak etiketi gösterme
-        sources = []
-    else:
-        # AI cevabında dönen hadislerin metni veya referansı geçiyorsa kaynakları göster
+    if hadith_dicts:
         filtered_sources = []
         for h in hadith_dicts:
             h_text = (h.get('text') or '')
             h_ref = (h.get('reference') or '')
             if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
                 filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-        # AI kaynak etiketi
         filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
         sources = filtered_sources if filtered_sources else sources
+    else:
+        sources = []
     # --- Sistem promptunun aynısını döndürmeyi engelle ---
     system_prompt_start = system_prompt[:80].lower()
     # Kısa/tek kelime sorularda kullanıcıyı yönlendir
@@ -222,13 +273,7 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
         answer = "Merhaba! Size nasıl yardımcı olabilirim?"
         sources = []
     # Genel yönlendirme veya açıklama isteyen cevaplarda kaynaklar kutusu gösterilmesin
-    GENERIC_ANSWERS = [
-        "sorunuzu daha açık yazar mısınız",
-        "daha detaylı bir soru sormanız gerekmektedir",
-        "yardımcı olabilmem için belirtir misiniz"
-    ]
-    if any(x in answer.lower() for x in GENERIC_ANSWERS):
-        sources = []
+    # Yönlendirme niteliğindeki cevaplarda dahi hadis bulunduysa kaynaklar korunur.
     # --- Kullanıcı geçmişine otomatik kayıt ---
     if user_id is not None:
         from database import AsyncSessionLocal
@@ -260,6 +305,12 @@ def get_sources():
 @app.post("/api/chat/session", response_model=SessionResponse)
 async def create_or_get_session(request: SessionRequest, current_user: User = Depends(get_current_user_optional)):
     async with AsyncSessionLocal() as session:
+        # Sequence onarımını güvence altına al (chat_sessions.id)
+        try:
+            await _ensure_sequence(session, "chat_sessions", "id")
+            print("[RT-SEQ-FIX] chat_sessions.id sequence kontrol/onarım tamamlandı")
+        except Exception:
+            print("[RT-SEQ-FIX] chat_sessions.id sequence kontrol/onarım atlandı")
         if request.session_token:
             # Mevcut session'ı bul
             result = await session.execute(
@@ -348,33 +399,75 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
             sources.append(SourceItem(type="hadis", name=display))
 
         # Gelişmiş kaynaklar kutusu mantığı (ask_ai ile uyumlu)
-        GENERIC_ANSWERS = [
-            "sorunuzu daha açık yazar mısınız",
-            "daha detaylı bir soru sormanız gerekmektedir",
-            "yardımcı olabilmem için belirtir misiniz"
-        ]
+        # Kaynakları her zaman göster: hadis bulunduysa listeyi koru,
+        # eşleşme tespit edilirse öncelikli olarak filtrelenmiş listeyi kullan.
         answer_lower = answer.lower()
-        if any(x in answer_lower for x in GENERIC_ANSWERS):
-            sources = []
-        elif not hadith_dicts:
-            # Hadis bulunamadıysa herhangi bir kaynak etiketi gösterme
-            sources = []
-        else:
-            # AI cevabında dönen hadislerin metni veya referansı geçiyorsa kaynakları göster
+        if hadith_dicts:
             filtered_sources = []
             for h in hadith_dicts:
                 h_text = (h.get('text') or '')
                 h_ref = (h.get('reference') or '')
                 if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
                     filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-            # AI kaynak etiketi
             filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
             sources = filtered_sources if filtered_sources else sources
+        else:
+            sources = []
 
         response = AskResponse(answer=answer, sources=sources)
     
+    # Yardımcı: sequence onarımını güvenli şekilde çalıştır
+    async def _ensure_sequence(session, tbl: str, col: str):
+        try:
+            # MAX(id)
+            max_res = await session.execute(text(f"SELECT COALESCE(MAX({col}), 0) FROM {tbl}"))
+            max_id = max_res.scalar() or 0
+            # pg_get_serial_sequence
+            seq_res = await session.execute(
+                text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=tbl, col=col)
+            )
+            seq_name = seq_res.scalar()
+            if not seq_name:
+                # information_schema üzerinden default
+                default_res = await session.execute(text(
+                    """
+                    SELECT column_default
+                    FROM information_schema.columns
+                    WHERE table_name = :tbl AND column_name = :col
+                    """
+                ).bindparams(tbl=tbl, col=col))
+                column_default = default_res.scalar()
+                if column_default and 'nextval' in column_default:
+                    try:
+                        start = column_default.find("'")
+                        end = column_default.find("'", start + 1)
+                        inferred_seq = column_default[start+1:end]
+                        seq_name = inferred_seq
+                        print(f"[RT-SEQ-FIX] {tbl}.{col} column_default üzerinden sequence bulundu: {seq_name}")
+                    except Exception:
+                        seq_name = None
+            if not seq_name:
+                # Fallback olarak varsayılan isimde sequence oluştur/bağla
+                fallback_seq = f"{tbl}_{col}_seq"
+                await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
+                await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {tbl}.{col}"))
+                await session.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
+                seq_name = fallback_seq
+                print(f"[RT-SEQ-FIX] {tbl}.{col} için fallback sequence oluşturuldu ve bağlandı: {seq_name}")
+            if max_id > 0:
+                # TRUE → bir sonraki nextval max_id+1 döner
+                await session.execute(
+                    text("SELECT setval(:seq::regclass, :newval, TRUE)").bindparams(seq=seq_name, newval=max_id)
+                )
+                print(f"[RT-SEQ-FIX] {tbl}.{col} için {seq_name} setval({max_id}, TRUE) uygulandı")
+        except Exception:
+            # Sessizce devam et (chat akışını bloklamasın)
+            print(f"[RT-SEQ-FIX] {tbl}.{col} sequence onarımında hata oluştu, devam ediliyor")
+
     # Session'a mesajları kaydet
     async with AsyncSessionLocal() as session:
+        # Önce chat_sessions ve chat_messages sequence’lerini onar
+        await _ensure_sequence(session, "chat_sessions", "id")
         # Session'ı bul veya oluştur
         result = await session.execute(
             select(ChatSession).where(ChatSession.session_token == request.session_token)
@@ -382,7 +475,12 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
         chat_session = result.scalar_one_or_none()
         
         if not chat_session:
+            # Güvenli id üretimi: sequence üzerinden nextval kullan
+            seq_name = await _get_sequence_name(session, "chat_sessions", "id")
+            next_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq=seq_name))
+            next_id = next_id_row.scalar()
             chat_session = ChatSession(
+                id=next_id,
                 user_id=current_user.id if current_user else None,
                 session_token=request.session_token
             )
@@ -390,16 +488,25 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
             await session.commit()
             await session.refresh(chat_session)
         
-        # Kullanıcı mesajını kaydet
+        # Mesaj eklemeden önce chat_messages sequence’ini onar
+        await _ensure_sequence(session, "chat_messages", "id")
+        # Kullanıcı mesajını kaydet (id'yi sequence üzerinden ver)
+        msg_seq = await _get_sequence_name(session, "chat_messages", "id")
+        next_user_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq=msg_seq))
+        next_user_id = next_user_id_row.scalar()
         user_message = ChatMessage(
+            id=next_user_id,
             session_id=chat_session.id,
             message_type="user",
             content=request.question
         )
         session.add(user_message)
         
-        # AI cevabını kaydet
+        # AI cevabını kaydet (id'yi sequence üzerinden ver)
+        next_ai_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq=msg_seq))
+        next_ai_id = next_ai_id_row.scalar()
         ai_message = ChatMessage(
+            id=next_ai_id,
             session_id=chat_session.id,
             message_type="assistant",
             content=response.answer,
@@ -420,7 +527,7 @@ async def hadith_search(q: str = Query(..., description="Aranacak metin"), top_k
     return [
         {
             "id": h.id,
-            "text": h.text,
+            "text": getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', ''),
             "source": h.source,
             "reference": h.reference,
             "category": h.category,
@@ -493,7 +600,15 @@ async def get_user_favorites(
     async with AsyncSessionLocal() as session:
         q = select(UserFavoriteHadith).options(selectinload(UserFavoriteHadith.hadith)).where(UserFavoriteHadith.user_id == resolved_user_id)
         if search:
-            q = q.where(or_(UserFavoriteHadith.hadith.has(Hadith.text.ilike(f"%{search}%")), UserFavoriteHadith.hadith.has(Hadith.source.ilike(f"%{source}%")), UserFavoriteHadith.hadith.has(Hadith.reference.ilike(f"%{reference}%"))))
+            # Güvenli arama: mevcut sütunlara göre dinamik koşullar oluştur
+            conditions = []
+            for col in ["turkish_text", "english_text", "arabic_text", "text", "source", "reference"]:
+                if hasattr(Hadith, col):
+                    conditions.append(
+                        UserFavoriteHadith.hadith.has(getattr(Hadith, col).ilike(f"%{search}%"))
+                    )
+            if conditions:
+                q = q.where(or_(*conditions))
         if category:
             q = q.where(UserFavoriteHadith.hadith.has(Hadith.category.ilike(f"%{category}%")))
         if source:
@@ -718,11 +833,74 @@ async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depe
     import json
     import sys
     import traceback
+    import csv
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    content = await file.read()
-    decoded = content.decode('utf-8').splitlines()
-    reader = csv.DictReader(decoded)
+    content_bytes = await file.read()
+    name = (file.filename or '').lower()
+    content_type = getattr(file, 'content_type', '') or ''
+
+    # JSON dosyasıysa esnek bir şekilde parse et
+    if name.endswith('.json') or 'json' in content_type:
+        try:
+            text = content_bytes.decode('utf-8', errors='ignore')
+            data = json.loads(text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON okunamadı: {e}")
+
+        # Liste ya da {'items': [...]} formatlarını destekle
+        if isinstance(data, dict) and isinstance(data.get('items'), list):
+            items = data['items']
+        elif isinstance(data, list):
+            items = data
+        else:
+            raise HTTPException(status_code=400, detail="Geçersiz JSON formatı. Liste veya 'items' alanı bekleniyor.")
+
+        skipped = []
+        eklenen = 0
+        async with AsyncSessionLocal() as session:
+            for idx, item in enumerate(items, 1):
+                try:
+                    turkish_text = item.get('turkish_text') or item.get('text_tr') or item.get('text') or item.get('tr_text')
+                    source = item.get('source') or item.get('book_name') or item.get('kitap') or item.get('collection')
+                    if not turkish_text or not source:
+                        print(f"ATLANIYOR (satır {idx}): Eksik zorunlu alan! turkish_text={turkish_text}, source={source}")
+                        skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
+                        continue
+
+                    # Opsiyonel alanları esnek eşle
+                    reference = item.get('reference')
+                    # Bazı datasetlerde numaraları birleştirelim
+                    if not reference:
+                        parts = []
+                        for key in ['hadith_number', 'hadis_no', 'bab']:
+                            val = item.get(key)
+                            if val:
+                                parts.append(str(val))
+                        reference = ', '.join(parts) if parts else None
+                    category = item.get('category') or item.get('kategori')
+                    language = item.get('language') or 'tr'
+
+                    hadith = Hadith(
+                        arabic_text=item.get('arabic_text') or item.get('text_ar') or None,
+                        turkish_text=turkish_text,
+                        source=source,
+                        reference=reference,
+                        category=category,
+                        language=language,
+                    )
+                    session.add(hadith)
+                    eklenen += 1
+                except Exception as e:
+                    print(f"ATLANIYOR (satır {idx}): HATA: {e}\n{traceback.format_exc()}")
+                    skipped.append({"row": idx, "reason": str(e)})
+            await session.commit()
+        print(f'JSON yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {len(skipped)}')
+        return {"status": "ok", "added": eklenen, "skipped": len(skipped), "skipped_details": skipped}
+
+    # Aksi halde CSV olarak devam et
+    decoded_lines = content_bytes.decode('utf-8', errors='ignore').splitlines()
+    reader = csv.DictReader(decoded_lines)
     new_hadiths = []
     skipped = []
     eklenen = 0
@@ -736,7 +914,6 @@ async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depe
                     skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
                     atlanan += 1
                     continue
-                import json
                 from datetime import datetime
                 def force_json_str(val):
                     import json
@@ -746,7 +923,7 @@ async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depe
                         try:
                             loaded = json.loads(val)
                             if isinstance(loaded, list):
-                                return val  # zaten doğru formatta
+                                return val
                             else:
                                 return json.dumps([val], ensure_ascii=False)
                         except Exception:
@@ -791,7 +968,7 @@ async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depe
                 skipped.append({"row": idx, "reason": str(e)})
                 atlanan += 1
         await session.commit()
-    print(f'Yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {atlanan}')
+    print(f'CSV yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {atlanan}')
     return {"status": "ok", "added": len(new_hadiths), "skipped": len(skipped), "skipped_details": skipped}
 
 @app.post("/admin/update_embeddings")
@@ -799,8 +976,98 @@ async def update_embeddings(current_user: User = Depends(get_current_user)):
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Yetkisiz erişim")
     from embedding_utils import update_hadith_embeddings
-    await update_hadith_embeddings()
-    return {"status": "embeddings_updated"}
+    try:
+        updated_count = await update_hadith_embeddings()
+        logging.info(f"Embedding güncelleme tamamlandı: {updated_count} kayıt güncellendi")
+        return {"status": "ok", "updated_count": updated_count}
+    except Exception as e:
+        logging.exception("Admin embedding güncelleme HATASI")
+        raise HTTPException(status_code=500, detail="Embedding güncelleme hatası")
+
+@app.get("/admin/embedding_status")
+async def embedding_status(current_user: User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    from sqlalchemy import func
+    async with AsyncSessionLocal() as session:
+        total = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
+        with_emb = (await session.execute(select(func.count(Hadith.id)).where(Hadith.embedding.isnot(None)))).scalar_one()
+        without_emb = total - with_emb
+        return {
+            "total_hadiths": total,
+            "with_embedding": with_emb,
+            "without_embedding": without_emb,
+        }
+
+@app.post("/admin/import_tr_json")
+async def admin_import_tr_json(current_user: User = Depends(get_current_user)):
+    """hadiths_tr.json dosyasını veritabanına import eder."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
+        from import_hadiths import import_hadiths
+        inserted = await import_hadiths(tr_path)
+        return {"status": "ok", "inserted": inserted}
+    except Exception as e:
+        logging.exception("Admin TR JSON import HATASI")
+        raise HTTPException(status_code=500, detail="TR JSON import hatası")
+
+@app.post("/admin/import_ar_json")
+async def admin_import_ar_json(current_user: User = Depends(get_current_user)):
+    """hadiths_ar.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
+        if not os.path.exists(ar_path):
+            raise HTTPException(status_code=404, detail="AR JSON bulunamadı")
+        from import_hadiths import _merge_language_json
+        count = await _merge_language_json(ar_path, lang='ar')
+        return {"status": "ok", "processed": count}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("Admin AR JSON import HATASI")
+        raise HTTPException(status_code=500, detail="AR JSON import hatası")
+
+@app.post("/admin/import_en_json")
+async def admin_import_en_json(current_user: User = Depends(get_current_user)):
+    """hadiths_en.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        en_path = os.path.join(backend_dir, "hadiths_en.json")
+        if not os.path.exists(en_path):
+            raise HTTPException(status_code=404, detail="EN JSON bulunamadı")
+        from import_hadiths import _merge_language_json
+        count = await _merge_language_json(en_path, lang='en')
+        return {"status": "ok", "processed": count}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("Admin EN JSON import HATASI")
+        raise HTTPException(status_code=500, detail="EN JSON import hatası")
+
+@app.post("/admin/import_all_json")
+async def admin_import_all_json(current_user: User = Depends(get_current_user)):
+    """TR + AR + EN JSON’ları sırayla içeri alır ve birleştirir."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
+        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
+        en_path = os.path.join(backend_dir, "hadiths_en.json")
+        from import_hadiths import import_hadiths_all
+        processed = await import_hadiths_all(tr_path, ar_path=ar_path, en_path=en_path)
+        return {"status": "ok", "processed": processed}
+    except Exception:
+        logging.exception("Admin ALL JSON import HATASI")
+        raise HTTPException(status_code=500, detail="ALL JSON import hatası")
 
 @app.get("/admin/users")
 async def list_users(current_user: User = Depends(get_current_user)):
@@ -1291,6 +1558,25 @@ async def get_quran(surah: str = None, ayah: int = None, language: str = 'tr', q
             query = query.where(QuranVerse.text.ilike(f'%{q}%'))
         result = await session.execute(query)
         verses = result.scalars().all()
+        import re
+
+        def build_audio_url(v, reciter_code: str | None):
+            if not reciter_code:
+                return None
+            # Varsayılan: DB’deki audio_url’den global ayet numarasını çıkar, yoksa ayah_number’a düş.
+            global_num = None
+            if getattr(v, 'audio_url', None):
+                m = re.search(r"/(\d+)\.mp3$", v.audio_url)
+                if m:
+                    try:
+                        global_num = int(m.group(1))
+                    except Exception:
+                        global_num = None
+            verse_num = global_num or getattr(v, 'ayah_number', None) or getattr(v, 'ayah', None)
+            if not verse_num:
+                return None
+            return f'https://cdn.islamic.network/quran/audio/128/{reciter_code}/{verse_num}.mp3'
+
         return [
             {
                 'id': v.id,
@@ -1304,7 +1590,8 @@ async def get_quran(surah: str = None, ayah: int = None, language: str = 'tr', q
                 'ayah_number': v.ayah_number,
                 'text_ar': v.text_ar,
                 'text_tr': v.text_tr,
-                'audio_url': f'https://cdn.islamic.network/quran/audio/128/{reciter}/{v.ayah_number}.mp3' if reciter else None
+                # Eğer reciter verilmişse doğru global ayet numarasını kullanarak URL üret, aksi halde DB’deki mevcut URL’yi bırak.
+                'audio_url': build_audio_url(v, reciter) if reciter else (v.audio_url or None)
             } for v in verses
         ]
 
@@ -1473,3 +1760,84 @@ def directions(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: 
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return r.json()
+
+# --- Kıble Yönü ---
+def _initial_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """(lat1, lon1) -> (lat2, lon2) için başlangıç açısını (true North'a göre derece) hesaplar."""
+    phi1, phi2 = radians(lat1), radians(lat2)
+    d_lambda = radians(lon2 - lon1)
+    x = sin(d_lambda) * cos(phi2)
+    y = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(d_lambda)
+    bearing = (degrees(atan2(x, y)) + 360.0) % 360.0
+    return bearing
+
+@app.get("/api/qibla_direction")
+def qibla_direction(lat: float = Query(...), lng: float = Query(...)):
+    """Verilen konumdan Kıble yönü: true North referanslı derece döndürür."""
+    kaaba_lat, kaaba_lng = 21.4225, 39.8262
+    b = _initial_bearing(lat, lng, kaaba_lat, kaaba_lng)
+    return {
+        "bearing_deg": round(b, 2),
+        "origin": {"lat": lat, "lng": lng},
+        "kaaba": {"lat": kaaba_lat, "lng": kaaba_lng},
+    }
+
+# --- Namaz Vakitleri Proxy ---
+@app.get("/api/prayer_times")
+def prayer_times(city: str, country: str = "Turkey", method: int = 2):
+    """Aladhan API üzerinden şehir bazlı namaz vakitlerini döndürür.
+    Frontend şehir adını gönderir; backend proxy olarak dış API ile konuşur.
+    """
+    try:
+        city_q = urllib.parse.quote(city)
+        country_q = urllib.parse.quote(country)
+        url = (
+            f"https://api.aladhan.com/v1/timingsByCity?city={city_q}&country={country_q}&method={method}"
+        )
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        data = r.json()
+        if not isinstance(data, dict) or "data" not in data:
+            raise HTTPException(status_code=500, detail="Geçersiz yanıt")
+        d = data["data"]
+        return {
+            "city": city,
+            "country": country,
+            "date": d.get("date", {}),
+            "timings": d.get("timings", {}),
+            "meta": d.get("meta", {}),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    async def _get_sequence_name(session, tbl: str, col: str) -> str:
+        # Sequence adını bulur; yoksa oluşturup bağlar ve döner
+        seq_res = await session.execute(
+            text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=tbl, col=col)
+        )
+        seq_name = seq_res.scalar()
+        if not seq_name:
+            default_res = await session.execute(text(
+                """
+                SELECT column_default
+                FROM information_schema.columns
+                WHERE table_name = :tbl AND column_name = :col
+                """
+            ).bindparams(tbl=tbl, col=col))
+            column_default = default_res.scalar()
+            if column_default and 'nextval' in column_default:
+                try:
+                    start = column_default.find("'")
+                    end = column_default.find("'", start + 1)
+                    seq_name = column_default[start+1:end]
+                except Exception:
+                    seq_name = None
+        if not seq_name:
+            fallback_seq = f"{tbl}_{col}_seq"
+            await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
+            await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {tbl}.{col}"))
+            await session.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
+            seq_name = fallback_seq
+        return seq_name
