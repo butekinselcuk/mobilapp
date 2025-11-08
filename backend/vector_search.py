@@ -53,14 +53,13 @@ async def search_hadiths(query: str, top_k: int = 3):
 
         # Aksi halde basit metin eşleşmesi ile geri dönüş
         like = f"%{query}%"
+        # Minimal şema uyumluluğu: sadece her iki şemada da bulunan alanları kullan
         fallback = (await session.execute(
             select(Hadith).where(
                 or_(
-                    Hadith.turkish_text.ilike(like),
+                    Hadith.text.ilike(like),
                     Hadith.source.ilike(like),
                     Hadith.reference.ilike(like),
-                    Hadith.kitap.ilike(like),
-                    Hadith.bab.ilike(like),
                 )
             ).limit(top_k)
         )).scalars().all()
