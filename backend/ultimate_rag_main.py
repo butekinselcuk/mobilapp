@@ -26,7 +26,12 @@ async def search_hadiths_ultimate(question: str, top_k: int = 3) -> List[Dict]:
     results = await search_hadiths(question, top_k=top_k)
     hadith_dicts: List[Dict] = []
     for h in results:
-        text = getattr(h, 'turkish_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', '')
+        text = (
+            getattr(h, 'turkish_text', None)
+            or getattr(h, 'english_text', None)
+            or getattr(h, 'arabic_text', None)
+            or getattr(h, 'text', '')
+        )
         source = getattr(h, 'source', '')
         reference = getattr(h, 'reference', '')
         hadith_dicts.append({
@@ -58,7 +63,7 @@ def _call_gemini(question: str, hadith_context: str) -> str:
     api_key = os.getenv('GEMINI_API_KEY')
     url = os.getenv('GEMINI_URL')
     if not api_key or not url:
-        return "Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin."
+        return "__GEMINI_NOT_CONFIGURED__"
     try:
         payload = {
             'question': question,
@@ -101,7 +106,32 @@ def generate_ai_response_with_fallback(question: str, hadith_dicts: List[Dict], 
     # 2) Gemini fallback
     if enable_gemini_fallback:
         answer = _call_gemini(question, hadith_context)
+        # Gemini kapalıysa hadislerden derlenmiş bir yanıt üret
+        if answer == "__GEMINI_NOT_CONFIGURED__":
+            composed = _compose_answer_from_hadiths(question, hadith_dicts)
+            return composed, True, 'hadis_compose'
         return answer, True, 'gemini'
 
     # 3) Son çare: basit mesaj
+    # Fallback tamamen kapalıysa ve elde hadisler varsa yine derlenmiş yanıt ver
+    if hadith_dicts:
+        return _compose_answer_from_hadiths(question, hadith_dicts), True, 'hadis_compose'
     return "Sorunuzu daha açık yazar mısınız?", True, 'fallback'
+
+def _compose_answer_from_hadiths(question: str, hadith_dicts: List[Dict], max_items: int = 3) -> str:
+    """Gemini kapalı olduğunda veya yanıt veremediğinde, bulunan hadislerden
+    anlaşılır ve kaynaklı bir cevap oluşturur."""
+    if not hadith_dicts:
+        return "Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin."
+    parts: List[str] = []
+    for h in hadith_dicts[:max_items]:
+        txt = (h.get('text') or '').strip()
+        src = h.get('source') or ''
+        ref = h.get('reference') or ''
+        ref_block = (f"Kaynak: {src} - {ref}").strip()
+        if txt:
+            parts.append(f"{txt}\n{ref_block}")
+        else:
+            parts.append(ref_block)
+    parts.append("Daha isabetli sonuçlar için konuyu biraz daraltarak sorabilirsiniz.")
+    return "\n\n".join(parts)
