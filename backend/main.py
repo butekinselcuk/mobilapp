@@ -227,17 +227,22 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
     if not current_user.is_premium:
         from database import AsyncSessionLocal
         from models import UserQuestionHistory
-        daily_limit = int(await get_setting('ai_daily_limit', 1))
+        daily_limit_raw = await get_setting('ai_daily_limit', '1')
+        try:
+            daily_limit = int(str(daily_limit_raw))
+        except Exception:
+            daily_limit = 1
         limit_message = await get_setting('ai_limit_message', 'Günlük ücretsiz sorgu limitinizi doldurdunuz. Premium’a geçin!')
         today = datetime.utcnow().date()
+        start_of_day = datetime.combine(today, datetime.min.time())
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(func.count()).where(
                     UserQuestionHistory.user_id == user_id,
-                    UserQuestionHistory.created_at >= today
+                    UserQuestionHistory.created_at >= start_of_day
                 )
             )
-            count = result.scalar()
+            count = result.scalar() or 0
             if count >= daily_limit:
                 raise HTTPException(status_code=429, detail=limit_message)
     # --- Ultimate RAG: vektör arama ve akıllı fallback yanıt üretimi ---
@@ -413,34 +418,6 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
                 request.question,
                 hadith_dicts,
                 True
-            )
-            # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
-            if not hadith_dicts:
-                answer = await get_setting(
-                    'ai_no_hadith_message',
-                    'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
-                )
-            # Kaynakları hazırla (UI için sade gösterim)
-            sources = []
-            for h in hadith_dicts:
-                display = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
-                sources.append(SourceItem(type="hadis", name=display))
-
-            # Gelişmiş kaynaklar kutusu mantığı (ask_ai ile uyumlu)
-            # Kaynakları her zaman göster: hadis bulunduysa listeyi koru,
-            # eşleşme tespit edilirse öncelikli olarak filtrelenmiş listeyi kullan.
-            answer_lower = answer.lower()
-            if hadith_dicts:
-                filtered_sources = []
-                for h in hadith_dicts:
-                    h_text = (h.get('text') or '')
-                    h_ref = (h.get('reference') or '')
-                    if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
-                        filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-                filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
-                sources = filtered_sources if filtered_sources else sources
-            else:
-                sources = []
             )
             # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
             if not hadith_dicts:
