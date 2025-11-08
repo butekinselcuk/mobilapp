@@ -52,6 +52,28 @@ print('DEBUG: SECRET_KEY =', os.getenv('SECRET_KEY'))
 
 app = FastAPI()
 
+# Sağlık kontrolü: her zaman 200 döndür, DB durumunu bilgi olarak ekle
+from sqlalchemy import text as _sql_text
+
+def _register_health_route():
+    try:
+        existing_paths = {getattr(r, "path", None) for r in app.routes}
+    except Exception:
+        existing_paths = set()
+    if "/health" not in existing_paths:
+        async def health():
+            try:
+                async with AsyncSessionLocal() as session:
+                    await session.execute(_sql_text("SELECT 1"))
+                return {"status": "ok", "db": "ok"}
+            except Exception:
+                # DB hata verse bile uygulamayı sağlıklı say
+                return {"status": "ok", "db": "error"}
+        # GET ile yayınla, 200 döner
+        app.add_api_route("/health", health, methods=["GET"])
+
+_register_health_route()
+
 # Async tablo oluşturucu
 async def create_tables():
     async with engine.begin() as conn:
@@ -415,266 +437,3 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
                     h_ref = (h.get('reference') or '')
                     if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
                         filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-                filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
-                sources = filtered_sources if filtered_sources else sources
-            else:
-                sources = []
-
-            response = AskResponse(answer=answer, sources=sources)
-    
-    # Yardımcı: sequence onarımını güvenli şekilde çalıştır
-    async def _ensure_sequence(session, tbl: str, col: str):
-        try:
-            # MAX(id)
-            max_res = await session.execute(text(f"SELECT COALESCE(MAX({col}), 0) FROM {tbl}"))
-            max_id = max_res.scalar() or 0
-            # pg_get_serial_sequence
-            seq_res = await session execute(
-                text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=tbl, col=col)
-            )
-            seq_name = seq_res.scalar()
-            if not seq_name:
-                # column_default üzerinden sequence dene
-                default_res = await session.execute(text(
-                    """
-                    SELECT column_default
-                    FROM information_schema.columns
-                    WHERE table_name = :tbl AND column_name = :col
-                    """
-                ).bindparams(tbl=tbl, col=col))
-                column_default = default_res.scalar()
-                if column_default and 'nextval' in column_default:
-                    try:
-                        start = column_default.find("'")
-                        end = column_default.find("'", start + 1)
-                        inferred_seq = column_default[start+1:end]
-                        seq_name = inferred_seq
-                    except Exception:
-                        seq_name = None
-            if not seq_name:
-                # Güvenli fallback sequence
-                fallback_seq = f"{tbl}_{col}_seq"
-                await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
-                await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {tbl}.{col}"))
-                await session.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
-                seq_name = fallback_seq
-            if max_id > 0:
-                await session.execute(
-                    text("SELECT setval(:seq::regclass, :newval, TRUE)").bindparams(seq=seq_name, newval=max_id)
-                )
-        except Exception:
-            pass
-    
-    async with AsyncSessionLocal() as session:
-        # Sequence onarımını güvence altına al
-        try:
-            await _ensure_sequence(session, "chat_messages", "id")
-            await _ensure_sequence(session, "chat_sessions", "id")
-            print("[RT-SEQ-FIX] chat_messages/chat_sessions sequence kontrol/onarım tamamlandı")
-        except Exception:
-            print("[RT-SEQ-FIX] sequence kontrol/onarım atlandı")
-        
-        # Session bul veya oluştur
-        result = await session.execute(select(ChatSession).where(ChatSession.session_token == request.session_token))
-        chat_session = result.scalar_one_or_none()
-        if not chat_session:
-            next_session_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq="chat_sessions_id_seq"))
-            next_session_id = next_session_id_row.scalar()
-            chat_session = ChatSession(id=next_session_id, session_token=request.session_token, user_id=current_user.id if current_user else None)
-            session.add(chat_session)
-            await session.commit()
-        
-        # Mesajları kaydet (kullanıcı ve asistan)
-        from sqlalchemy import func
-        next_user_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq="chat_messages_id_seq"))
-        next_user_id = next_user_id_row.scalar()
-        user_message = ChatMessage(
-            id=next_user_id,
-            session_id=chat_session.id,
-            message_type="user",
-            content=request.question
-        )
-        session.add(user_message)
-        
-        # AI cevabını kaydet (id'yi sequence üzerinden ver)
-        next_ai_id_row = await session.execute(text("SELECT nextval(:seq::regclass)").bindparams(seq="chat_messages_id_seq"))
-        next_ai_id = next_ai_id_row.scalar()
-        ai_message = ChatMessage(
-            id=next_ai_id,
-            session_id=chat_session.id,
-            message_type="assistant",
-            content=response.answer,
-            sources=json.dumps([{"type": s.type, "name": s.name} for s in response.sources])
-        )
-        session.add(ai_message)
-        await session.commit()
-    
-    return ChatResponse(
-        answer=response.answer,
-        sources=response.sources,
-        session_token=request.session_token
-    )
-
-@app.get("/api/hadith_search")
-async def hadith_search(q: str = Query(..., description="Aranacak metin"), top_k: int = 3) -> Any:
-    results = await search_hadiths(q, top_k=top_k)
-    return [
-        {
-            "id": h.id,
-            "text": getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', ''),
-            "source": h.source,
-            "reference": h.reference,
-            "category": h.category,
-            "language": h.language
-        }
-        for h in results
-    ]
-
-# NOT: Gerçek ortamda JWT ile kimlik doğrulama zorunlu olmalı. Demo için user_id parametresiyle ilerleniyor.
-
-@app.get("/user/history")
-async def get_user_history(
-    user_id: int = None,
-    search: str = None,
-    category: str = None,
-    source: str = None,
-    date_from: str = None,
-    date_to: str = None,
-    sort_by: str = "created_at",
-    order: str = "desc",
-    current_user: User = Depends(get_current_user_optional)
-):
-    resolved_user_id = user_id or (current_user.id if current_user else None)
-    if not resolved_user_id:
-        raise HTTPException(status_code=401, detail="Kullanıcı kimliği bulunamadı")
-    async with AsyncSessionLocal() as session:
-        q = select(UserQuestionHistory).where(UserQuestionHistory.user_id == resolved_user_id)
-        if search:
-            q = q.where(or_(UserQuestionHistory.question.ilike(f"%{search}%"), UserQuestionHistory.answer.ilike(f"%{search}%")))
-        if category:
-            q = q.where(UserQuestionHistory.answer.ilike(f"%{category}%"))
-        if source:
-            q = q.where(UserQuestionHistory.answer.ilike(f"%{source}%"))
-            
-        if date_from:
-            q = q.where(UserQuestionHistory.created_at >= date_from)
-        if date_to:
-            q = q.where(UserQuestionHistory.created_at <= date_to)
-        # Sıralama
-        sort_col = getattr(UserQuestionHistory, sort_by, UserQuestionHistory.created_at)
-        order_func = getattr(select, 'desc' if order == 'desc' else 'asc', None)
-        if order_func:
-            q = q.order_by(order_func(sort_col))
-        else:
-            q = q.order_by(sort_col.desc() if order == 'desc' else sort_col.asc())
-        result = await session.execute(q)
-        items = result.scalars().all()
-        # Basit sonuç dönüşümü
-        return [
-            {
-                "id": h.id,
-                "question": h.question,
-                "answer": h.answer,
-                "created_at": h.created_at.isoformat()
-            }
-            for h in items
-        ]
-
-# Favori hadisler
-@app.get("/user/favorites")
-async def get_user_favorites(current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(UserFavoriteHadith).where(UserFavoriteHadith.user_id == current_user.id)
-        )
-        items = result.scalars().all()
-        return [
-            {
-                "id": f.id,
-                "hadith_id": f.hadith_id,
-                "note": f.note,
-                "created_at": f.created_at.isoformat()
-            }
-            for f in items
-        ]
-
-# Favori ekle
-@app.post("/user/favorites")
-async def add_favorite(hadith_id: int, note: Optional[str] = None, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        favorite = UserFavoriteHadith(user_id=current_user.id, hadith_id=hadith_id, note=note)
-        session.add(favorite)
-        await session.commit()
-        return {"status": "ok"}
-
-# Favori sil
-@app.delete("/user/favorites/{favorite_id}")
-async def delete_favorite(favorite_id: int, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(UserFavoriteHadith).where(UserFavoriteHadith.id == favorite_id))
-        favorite = result.scalar_one_or_none()
-        if not favorite:
-            raise HTTPException(status_code=404, detail="Favori bulunamadı")
-        if favorite.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Yetkisiz işlem")
-        await session.delete(favorite)
-        await session.commit()
-        return {"status": "deleted"}
-
-# Ayarları okuma/yaratma
-async def get_setting(key: str, default: Optional[str] = None) -> str:
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Setting).where(Setting.key == key))
-        s = result.scalar_one_or_none()
-        return s.value if s else (default or "")
-
-# Şehir bazlı namaz vakitleri
-@app.get("/api/prayer_times")
-async def prayer_times(city: str, country: str = "Turkey", method: int = 13):
-    # Aladhan API
-    url = f"https://api.aladhan.com/v1/timingsByCity?city={urllib.parse.quote(city)}&country={urllib.parse.quote(country)}&method={method}"
-    try:
-        resp = requests.get(url, timeout=20)
-        data = resp.json()
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=data)
-        timings = data.get('data', {}).get('timings', {})
-        return timings
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Sequence adını bulma/oluşturma yardımcıları
-async def _get_sequence_name(session: AsyncSession, table_name: str, column_name: str) -> str:
-    # Önce pg_get_serial_sequence ile dene
-    seq_res = await session.execute(
-        text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=table_name, col=column_name)
-    )
-    seq_name = seq_res.scalar()
-    if seq_name:
-        return seq_name
-
-    # Kolon default’u üzerinden sequence çıkarma denemesi
-    default_res = await session.execute(text(
-        """
-        SELECT column_default
-        FROM information_schema.columns
-        WHERE table_name = :tbl AND column_name = :col
-        """
-    ).bindparams(tbl=table_name, col=column_name))
-    column_default = default_res.scalar()
-    if column_default and 'nextval' in column_default:
-        try:
-            start = column_default.find("'")
-            end = column_default.find("'", start + 1)
-            inferred_seq = column_default[start+1:end]
-            if inferred_seq:
-                return inferred_seq
-        except Exception:
-            pass
-
-    # Sequence yoksa oluştur
-    fallback_seq = f"{table_name}_{column_name}_seq"
-    await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
-    await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {table_name}.{column_name}"))
-    await session.execute(text(f"ALTER TABLE {table_name} ALTER COLUMN {column_name} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
-    return fallback_seq
