@@ -190,11 +190,10 @@ async def on_startup():
 # CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
 app.add_middleware(
     CORSMiddleware,
-    # Geliştirme ve Expo Web için açıkça izin verilen origin'ler
-    allow_origins=[],
-    # localhost/127.0.0.1 ve tüm *.expo.dev alt alan adlarını kapsayan regex
-    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\\d+)?|https://.*\.expo\.dev)$",
-    # Kimlik bilgisi gerekmiyor (Bearer token header ile çalışıyoruz)
+    # Kayıt/Giriş ve web istemcisi için her origin'e izin ver (Render + localhost)
+    # allow_credentials False iken '*' güvenlidir ve preflight için header'ları ekler.
+    allow_origins=["*"],
+    allow_origin_regex=None,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -454,101 +453,57 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
                 hadith_dicts,
                 True
             )
-            # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
             if not hadith_dicts:
                 answer = await get_setting(
                     'ai_no_hadith_message',
                     'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
                 )
-            # Kaynakları hazırla (UI için sade gösterim)
             sources = []
-            for h in hadith_dicts:
-                base = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
-                score = h.get('score')
-                display = f"{base} (skor: {score:.2f})" if isinstance(score, (int, float)) and score is not None else base
-                sources.append(SourceItem(type="hadis", name=display))
-
-            # Gelişmiş kaynaklar kutusu mantığı (ask_ai ile uyumlu)
-            # Kaynakları her zaman göster: hadis bulunduysa listeyi koru,
-            # eşleşme tespit edilirse öncelikli olarak filtrelenmiş listeyi kullan.
-            answer_lower = answer.lower()
-            if hadith_dicts:
-                filtered_sources = []
-                for h in hadith_dicts:
-                    h_text = (h.get('text') or '')
-                    h_ref = (h.get('reference') or '')
-                    if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
-                        filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-                _rt = (response_type or '').lower()
-                _suffix = ' -AI'
-                if 'claude' in _rt:
-                    _suffix = ' -AI CL'
-                elif 'gemini' in _rt:
-                    _suffix = ' -AI GMN'
-                filtered_sources.append(SourceItem(type="ai", name=f"AI Asistan{_suffix}"))
-                sources = filtered_sources if filtered_sources else sources
-            else:
-                sources = []
-
+            for h in hadith_dicts or []:
+                base = f"{h.get('source','')} - {h.get('reference','')}"
+                sources.append(SourceItem(type="hadis", name=base))
             response = AskResponse(answer=answer, sources=sources)
-    # Session'a mesajları kaydet
+    
+    # Mesajı session'a kaydet
     async with AsyncSessionLocal() as session:
-        # Session'ı bul veya oluştur
-        result = await session.execute(
-            select(ChatSession).where(ChatSession.session_token == request.session_token)
-        )
+        # Sequence onarımını güvence altına al (chat_messages.id)
+        try:
+            await _ensure_sequence(session, "chat_messages", "id")
+            print("[RT-SEQ-FIX] chat_messages.id sequence kontrol/onarım tamamlandı")
+        except Exception:
+            print("[RT-SEQ-FIX] chat_messages.id sequence kontrol/onarım atlandı")
+        # Session'ı al veya oluştur
+        result = await session.execute(select(ChatSession).where(ChatSession.session_token == request.session_token))
         chat_session = result.scalar_one_or_none()
-        
         if not chat_session:
-            # Varsayılan autoincrement ile oluştur
-            chat_session = ChatSession(
-                user_id=current_user.id if current_user else None,
-                session_token=request.session_token
-            )
+            chat_session = ChatSession(session_token=request.session_token, user_id=current_user.id if current_user else None)
             session.add(chat_session)
             await session.commit()
             await session.refresh(chat_session)
-        
-        # Kullanıcı mesajını kaydet (DB autoincrement kullan)
-        user_message = ChatMessage(
+        # Mesaj ekle
+        sources_json = json.dumps([s.dict() for s in response.sources]) if response.sources else None
+        chat_message = ChatMessage(
             session_id=chat_session.id,
-            message_type="user",
-            content=request.question
-        )
-        session.add(user_message)
-        
-        # AI cevabını kaydet (DB autoincrement kullan)
-        ai_message = ChatMessage(
-            session_id=chat_session.id,
-            message_type="assistant",
+            message_type="answer",
             content=response.answer,
-            sources=json.dumps([{"type": s.type, "name": s.name} for s in response.sources])
+            sources=sources_json
         )
-        session.add(ai_message)
+        session.add(chat_message)
         await session.commit()
     
-    return ChatResponse(
-        answer=response.answer,
-        sources=response.sources,
-        session_token=request.session_token
-    )
+    return ChatResponse(answer=response.answer, sources=response.sources, session_token=request.session_token)
 
 @app.get("/api/hadith_search")
 async def hadith_search(q: str = Query(..., description="Aranacak metin"), top_k: int = 3) -> Any:
-    results = await search_hadiths(q, top_k=top_k)
-    return [
-        {
-            "id": h.id,
-            "text": getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', ''),
-            "source": h.source,
-            "reference": h.reference,
-            "category": h.category,
-            "language": h.language
+    try:
+        results = await search_hadiths(q, top_k=top_k)
+        return {
+            "results": results,
+            "count": len(results)
         }
-        for h in results
-    ]
-
-# NOT: Gerçek ortamda JWT ile kimlik doğrulama zorunlu olmalı. Demo için user_id parametresiyle ilerleniyor.
+    except Exception as e:
+        logging.exception("Hadis arama hatası")
+        raise HTTPException(status_code=500, detail="Arama sırasında bir hata oluştu")
 
 @app.get("/user/history")
 async def get_user_history(
@@ -562,39 +517,43 @@ async def get_user_history(
     order: str = "desc",
     current_user: User = Depends(get_current_user_optional)
 ):
-    resolved_user_id = user_id or (current_user.id if current_user else None)
-    if not resolved_user_id:
-        raise HTTPException(status_code=401, detail="Kullanıcı kimliği bulunamadı")
     async with AsyncSessionLocal() as session:
-        q = select(UserQuestionHistory).where(UserQuestionHistory.user_id == resolved_user_id)
+        query = select(UserQuestionHistory)
+        if user_id:
+            query = query.where(UserQuestionHistory.user_id == user_id)
         if search:
-            q = q.where(or_(UserQuestionHistory.question.ilike(f"%{search}%"), UserQuestionHistory.answer.ilike(f"%{search}%")))
+            query = query.where(UserQuestionHistory.question.ilike(f"%{search}%"))
         if category:
-            q = q.where(UserQuestionHistory.answer.ilike(f"%{category}%"))
+            query = query.where(UserQuestionHistory.category == category)
         if source:
-            q = q.where(UserQuestionHistory.answer.ilike(f"%{source}%"))
-            
+            query = query.where(UserQuestionHistory.source == source)
         if date_from:
-            q = q.where(UserQuestionHistory.created_at >= date_from)
+            try:
+                date_from_dt = datetime.strptime(date_from, "%Y-%m-%d")
+                query = query.where(UserQuestionHistory.created_at >= date_from_dt)
+            except Exception:
+                pass
         if date_to:
-            q = q.where(UserQuestionHistory.created_at <= date_to)
-        # Sıralama
-        sort_col = getattr(UserQuestionHistory, sort_by, UserQuestionHistory.created_at)
-        if order == "asc":
-            q = q.order_by(sort_col.asc())
+            try:
+                date_to_dt = datetime.strptime(date_to, "%Y-%m-%d")
+                query = query.where(UserQuestionHistory.created_at <= date_to_dt)
+            except Exception:
+                pass
+        if sort_by == "created_at":
+            query = query.order_by(UserQuestionHistory.created_at.desc() if order == "desc" else UserQuestionHistory.created_at.asc())
         else:
-            q = q.order_by(sort_col.desc())
-        result = await session.execute(q)
-        history = result.scalars().all()
-        return [
+            query = query.order_by(UserQuestionHistory.id.desc() if order == "desc" else UserQuestionHistory.id.asc())
+        result = await session.execute(query)
+        items = [
             {
-                "id": h.id,  # id alanı eklendi
+                "id": h.id,
                 "question": h.question,
-                "answer": h.answer,
-                "created_at": h.created_at,
-                "hadith_id": h.hadith_id,
-            } for h in history
+                "answer": h.answer[:120] if h.answer else None,
+                "created_at": h.created_at.isoformat(),
+            }
+            for h in result.scalars().all()
         ]
+        return {"items": items, "count": len(items)}
 
 @app.get("/user/favorites")
 async def get_user_favorites(
@@ -606,56 +565,36 @@ async def get_user_favorites(
     order: str = "desc",
     current_user: User = Depends(get_current_user_optional)
 ):
-    resolved_user_id = user_id or (current_user.id if current_user else None)
-    if not resolved_user_id:
-        raise HTTPException(status_code=401, detail="Kullanıcı kimliği bulunamadı")
     async with AsyncSessionLocal() as session:
-        q = select(UserFavoriteHadith).options(selectinload(UserFavoriteHadith.hadith)).where(UserFavoriteHadith.user_id == resolved_user_id)
+        query = select(UserFavoriteHadith).join(Hadith, UserFavoriteHadith.hadith_id == Hadith.id)
+        if user_id:
+            query = query.where(UserFavoriteHadith.user_id == user_id)
         if search:
-            # Güvenli arama: mevcut sütunlara göre dinamik koşullar oluştur
-            conditions = []
-            for col in ["turkish_text", "english_text", "arabic_text", "text", "source", "reference"]:
-                if hasattr(Hadith, col):
-                    conditions.append(
-                        UserFavoriteHadith.hadith.has(getattr(Hadith, col).ilike(f"%{search}%"))
-                    )
-            if conditions:
-                q = q.where(or_(*conditions))
+            query = query.where(Hadith.text.ilike(f"%{search}%"))
         if category:
-            q = q.where(UserFavoriteHadith.hadith.has(Hadith.category.ilike(f"%{category}%")))
+            query = query.where(Hadith.source.ilike(f"%{category}%"))
         if source:
-            q = q.where(UserFavoriteHadith.hadith.has(Hadith.source.ilike(f"%{source}%")))
-        sort_col = getattr(UserFavoriteHadith, sort_by, UserFavoriteHadith.id)
-        if order == "asc":
-            q = q.order_by(sort_col.asc())
+            query = query.where(Hadith.reference.ilike(f"%{source}%"))
+        if sort_by == "id":
+            query = query.order_by(UserFavoriteHadith.id.desc() if order == "desc" else UserFavoriteHadith.id.asc())
         else:
-            q = q.order_by(sort_col.desc())
-        result = await session.execute(q)
-        favs = result.scalars().all()
-        return [
+            query = query.order_by(Hadith.text.desc() if order == "desc" else Hadith.text.asc())
+        result = await session.execute(query)
+        items = [
             {
-                "id": f.hadith.id,
-                "text": f.hadith.turkish_text or f.hadith.arabic_text,
-                "source": f.hadith.source,
-                "reference": f.hadith.reference,
-                "category": f.hadith.category,
-                "language": f.hadith.language
-            } for f in favs if f.hadith
+                "id": fav.id,
+                "hadith_id": fav.hadith_id,
+                "text": fav.hadith.text[:120] if fav.hadith and fav.hadith.text else None,
+                "source": fav.hadith.source if fav.hadith else None,
+                "reference": fav.hadith.reference if fav.hadith else None,
+            }
+            for fav in result.scalars().all()
         ]
+        return {"items": items, "count": len(items)}
 
 @app.post("/user/favorites")
 async def add_favorite(hadith_id: int, current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        # Önce var mı kontrol et
-        result = await session.execute(
-            select(UserFavoriteHadith).where(
-                UserFavoriteHadith.user_id == current_user.id,
-                UserFavoriteHadith.hadith_id == hadith_id
-            )
-        )
-        existing = result.scalar_one_or_none()
-        if existing:
-            return {"status": "already_exists"}
         fav = UserFavoriteHadith(user_id=current_user.id, hadith_id=hadith_id)
         session.add(fav)
         await session.commit()
@@ -664,15 +603,12 @@ async def add_favorite(hadith_id: int, current_user: User = Depends(get_current_
 @app.delete("/user/favorites")
 async def remove_favorite(hadith_id: int, current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(UserFavoriteHadith).where(UserFavoriteHadith.user_id == current_user.id, UserFavoriteHadith.hadith_id == hadith_id)
-        )
+        result = await session.execute(select(UserFavoriteHadith).where(UserFavoriteHadith.user_id == current_user.id, UserFavoriteHadith.hadith_id == hadith_id))
         fav = result.scalar_one_or_none()
-        if not fav:
-            raise HTTPException(status_code=404, detail="Favori bulunamadı")
-        await session.delete(fav)
-        await session.commit()
-        return {"status": "deleted"}
+        if fav:
+            await session.delete(fav)
+            await session.commit()
+        return {"status": "ok"}
 
 class DeleteManyFavoritesRequest(BaseModel):
     hadith_ids: List[int]
@@ -683,105 +619,60 @@ class DeleteManyHistoryRequest(BaseModel):
 @app.post("/user/favorites/delete_many")
 async def delete_many_favorites(req: DeleteManyFavoritesRequest, current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        await session.execute(
-            UserFavoriteHadith.__table__.delete().where(
-                UserFavoriteHadith.user_id == current_user.id,
-                UserFavoriteHadith.hadith_id.in_(req.hadith_ids)
-            )
-        )
+        await session.execute(text("DELETE FROM user_favorite_hadith WHERE user_id = :uid AND hadith_id = ANY(:ids)").bindparams(uid=current_user.id, ids=req.hadith_ids))
         await session.commit()
-        return {"status": "deleted", "count": len(req.hadith_ids)}
+        return {"status": "ok"}
 
 @app.post("/user/history/delete_many")
 async def delete_many_history(req: DeleteManyHistoryRequest, current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        await session.execute(
-            UserQuestionHistory.__table__.delete().where(
-                UserQuestionHistory.user_id == current_user.id,
-                UserQuestionHistory.id.in_(req.history_ids)
-            )
-        )
+        await session.execute(text("DELETE FROM user_question_history WHERE user_id = :uid AND id = ANY(:ids)").bindparams(uid=current_user.id, ids=req.history_ids))
         await session.commit()
-        return {"status": "deleted", "count": len(req.history_ids)}
+        return {"status": "ok"}
 
 @app.get("/user/recommendations")
 async def get_user_recommendations(current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        # Kullanıcının en çok favorilediği hadisler (top 3)
-        user_favs = await session.execute(
-            select(UserFavoriteHadith.hadith_id, Hadith.turkish_text, Hadith.arabic_text, Hadith.source, Hadith.reference, Hadith.category, Hadith.language)
-            .join(Hadith, UserFavoriteHadith.hadith_id == Hadith.id)
-            .where(UserFavoriteHadith.user_id == current_user.id)
-        )
-        user_fav_list = user_favs.fetchall()
-        # En çok tekrar eden ilk 3 hadisi bul
-        user_counter = Counter([row.hadith_id for row in user_fav_list])
-        user_top_ids = [item[0] for item in user_counter.most_common(3)]
-        user_top_hadiths = [dict(
-            id=row.hadith_id,
-            text=row.turkish_text or row.arabic_text,
-            source=row.source,
-            reference=row.reference,
-            category=row.category,
-            language=row.language
-        ) for row in user_fav_list if row.hadith_id in user_top_ids]
-        # Haftanın hadisi (son 7 gün)
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        week_favs = await session.execute(
-            select(UserFavoriteHadith.hadith_id, Hadith.turkish_text, Hadith.arabic_text, Hadith.source, Hadith.reference, Hadith.category, Hadith.language)
-            .join(Hadith, UserFavoriteHadith.hadith_id == Hadith.id)
-            .where(UserFavoriteHadith.created_at >= week_ago)
-        )
-        week_fav_list = week_favs.fetchall()
-        week_counter = Counter([row.hadith_id for row in week_fav_list])
-        if week_counter:
-            week_top_id = week_counter.most_common(1)[0][0]
-            week_top = next((dict(
-                id=row.hadith_id,
-                text=row.turkish_text or row.arabic_text,
-                source=row.source,
-                reference=row.reference,
-                category=row.category,
-                language=row.language
-            ) for row in week_fav_list if row.hadith_id == week_top_id), None)
-        else:
-            week_top = None
-        return {
-            "user_top_hadiths": user_top_hadiths,
-            "week_top_hadith": week_top
-        } 
+        result = await session.execute(select(UserQuestionHistory).where(UserQuestionHistory.user_id == current_user.id))
+        histories = result.scalars().all()
+        texts = [h.question for h in histories]
+        counter = Counter()
+        for t in texts:
+            for w in t.split():
+                counter[w.lower()] += 1
+        common_words = [w for w, c in counter.most_common(5)]
+        suggestions = [f"'{w}' hakkında daha fazla bilgi almak ister misiniz?" for w in common_words]
+        return {"suggestions": suggestions}
 
 @app.post("/user/activate_premium")
 async def activate_premium(current_user: User = Depends(get_current_user)):
     async with AsyncSessionLocal() as session:
-        db_user = await session.get(User, current_user.id)
-        if not db_user:
+        result = await session.execute(select(User).where(User.id == current_user.id))
+        user = result.scalar_one_or_none()
+        if not user:
             raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
-        db_user.is_premium = True
-        db_user.premium_expiry = datetime.utcnow() + timedelta(days=30)
+        user.is_premium = True
         await session.commit()
-        await session.refresh(db_user)
-        return {
-            "status": "premium_activated",
-            "premium_expiry": db_user.premium_expiry.isoformat()
-        } 
+        return {"status": "ok"}
 
 async def get_setting(key: str, default=None):
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Setting).where(Setting.key == key))
-        setting = result.scalar_one_or_none()
-        if setting:
-            return setting.value
-        return default 
+        s = result.scalar_one_or_none()
+        return s.value if s else default
 
 @app.get("/admin/settings")
 async def list_settings(current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Setting))
-        settings = result.scalars().all()
-        return [{"key": s.key, "value": s.value} for s in settings]
+        items = [
+            {
+                "key": s.key,
+                "value": s.value,
+            }
+            for s in result.scalars().all()
+        ]
+        return {"items": items}
 
 class SettingUpdateRequest(BaseModel):
     key: str
@@ -789,728 +680,91 @@ class SettingUpdateRequest(BaseModel):
 
 @app.post("/admin/settings")
 async def update_setting(req: SettingUpdateRequest, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Setting).where(Setting.key == req.key))
-        setting = result.scalar_one_or_none()
-        if setting:
-            setting.value = req.value
+        s = result.scalar_one_or_none()
+        if not s:
+            s = Setting(key=req.key, value=req.value)
+            session.add(s)
         else:
-            setting = Setting(key=req.key, value=req.value)
-            session.add(setting)
+            s.value = req.value
         await session.commit()
-        return {"key": req.key, "value": req.value} 
+        return {"status": "ok"}
 
-class UserUpdateRequest(BaseModel):
-    username: Optional[str] = None
-    email: Optional[EmailStr] = None
-
-class ChangePasswordRequest(BaseModel):
-    old_password: str
-    new_password: str
-
-class ThemeUpdateRequest(BaseModel):
-    theme: Literal["light", "dark"]
-
-@app.patch("/user/update")
-async def update_user_profile(req: UserUpdateRequest, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, current_user.id)
-        if req.username:
-            user.username = req.username
-        if req.email:
-            user.email = req.email
-        await session.commit()
-        return {"status": "updated", "username": user.username, "email": user.email}
-
-@app.post("/user/change_password")
-async def change_password(req: ChangePasswordRequest, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, current_user.id)
-        from auth import verify_password, get_password_hash
-        if not verify_password(req.old_password, user.hashed_password):
-            raise HTTPException(status_code=400, detail="Mevcut şifre yanlış.")
-        # Şifre karmaşıklık doğrulaması
-        npw = req.new_password or ""
-        if not (
-            len(npw) >= 8 and
-            re.search(r"[A-Z]", npw) and
-            re.search(r"[a-z]", npw) and
-            re.search(r"\d", npw) and
-            re.search(r"[^A-Za-z0-9]", npw)
-        ):
-            raise HTTPException(status_code=400, detail="Yeni şifre karmaşıklık kurallarını sağlamıyor.")
-        user.hashed_password = get_password_hash(req.new_password)
-        await session.commit()
-        return {"status": "password_changed"}
-
-@app.post("/user/theme")
-async def update_theme(req: ThemeUpdateRequest, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, current_user.id)
-        user.theme_preference = req.theme
-        await session.commit()
-        return {"status": "updated", "theme_preference": user.theme_preference}
-
+# Avatar upload
 @app.post("/user/avatar")
 async def upload_avatar(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    # İçerik türü ve boyut doğrulama
-    if file.content_type not in ("image/jpeg", "image/png"):
-        raise HTTPException(status_code=400, detail="Sadece JPEG/PNG desteklenir.")
-    data = await file.read()
-    max_bytes = 2 * 1024 * 1024
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=400, detail="Dosya boyutu 2MB limitini aşıyor.")
-
-    # Dosya adı ve uzantı belirleme
-    ext = "jpg" if file.content_type == "image/jpeg" else "png"
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    fpath = os.path.join(_avatars_dir, fname)
-
-    # 500x500 center-crop ve kaydetme (Pillow varsa)
-    try:
-        if PIL_AVAILABLE:
-            from io import BytesIO
-            buf = BytesIO(data)
-            img = Image.open(buf)
-            img = img.convert("RGB")
-            w, h = img.size
-            # Kare kırpma (merkez)
-            side = min(w, h)
-            left = (w - side) // 2
-            top = (h - side) // 2
-            img = img.crop((left, top, left + side, top + side))
-            img = img.resize((500, 500))
-            img.save(fpath, format="JPEG", quality=90)
-        else:
-            # Pillow yoksa raw veriyi doğrudan yaz (boyut doğrulaması zaten yapıldı)
-            with open(fpath, "wb") as f:
-                f.write(data)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Avatar işleme sırasında hata oluştu.")
-
-    url = f"/static/avatars/{fname}"
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, current_user.id)
-        user.avatar_url = url
-        await session.commit()
-        return {"status": "uploaded", "avatar_url": url}
-
-@app.delete("/user/delete")
-async def delete_account(current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, current_user.id)
-        await session.delete(user)
-        await session.commit()
-        return {"status": "deleted"} 
-
-@app.post("/admin/upload_hadiths")
-async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    import json
-    import sys
-    import traceback
-    import csv
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    content_bytes = await file.read()
-    name = (file.filename or '').lower()
-    content_type = getattr(file, 'content_type', '') or ''
-
-    # JSON dosyasıysa esnek bir şekilde parse et
-    if name.endswith('.json') or 'json' in content_type:
-        try:
-            text = content_bytes.decode('utf-8', errors='ignore')
-            data = json.loads(text)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"JSON okunamadı: {e}")
-
-        # Liste ya da {'items': [...]} formatlarını destekle
-        if isinstance(data, dict) and isinstance(data.get('items'), list):
-            items = data['items']
-        elif isinstance(data, list):
-            items = data
-        else:
-            raise HTTPException(status_code=400, detail="Geçersiz JSON formatı. Liste veya 'items' alanı bekleniyor.")
-
-        skipped = []
-        eklenen = 0
-        async with AsyncSessionLocal() as session:
-            for idx, item in enumerate(items, 1):
-                try:
-                    turkish_text = item.get('turkish_text') or item.get('text_tr') or item.get('text') or item.get('tr_text')
-                    source = item.get('source') or item.get('book_name') or item.get('kitap') or item.get('collection')
-                    if not turkish_text or not source:
-                        print(f"ATLANIYOR (satır {idx}): Eksik zorunlu alan! turkish_text={turkish_text}, source={source}")
-                        skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
-                        continue
-
-                    # Opsiyonel alanları esnek eşle
-                    reference = item.get('reference')
-                    # Bazı datasetlerde numaraları birleştirelim
-                    if not reference:
-                        parts = []
-                        for key in ['hadith_number', 'hadis_no', 'bab']:
-                            val = item.get(key)
-                            if val:
-                                parts.append(str(val))
-                        reference = ', '.join(parts) if parts else None
-                    category = item.get('category') or item.get('kategori')
-                    language = item.get('language') or 'tr'
-
-                    hadith = Hadith(
-                        arabic_text=item.get('arabic_text') or item.get('text_ar') or None,
-                        turkish_text=turkish_text,
-                        source=source,
-                        reference=reference,
-                        category=category,
-                        language=language,
-                    )
-                    session.add(hadith)
-                    eklenen += 1
-                except Exception as e:
-                    print(f"ATLANIYOR (satır {idx}): HATA: {e}\n{traceback.format_exc()}")
-                    skipped.append({"row": idx, "reason": str(e)})
-            await session.commit()
-        print(f'JSON yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {len(skipped)}')
-        return {"status": "ok", "added": eklenen, "skipped": len(skipped), "skipped_details": skipped}
-
-    # Aksi halde CSV olarak devam et
-    decoded_lines = content_bytes.decode('utf-8', errors='ignore').splitlines()
-    reader = csv.DictReader(decoded_lines)
-    new_hadiths = []
-    skipped = []
-    eklenen = 0
-    atlanan = 0
-    async with AsyncSessionLocal() as session:
-        for idx, row in enumerate(reader, 1):
-            try:
-                turkish_text = row.get('turkish_text') or row.get('text')
-                if not turkish_text or not row.get('source'):
-                    print(f"ATLANIYOR (satır {idx}): Eksik zorunlu alan! hadis_id={row.get('hadis_id')}, turkish_text={turkish_text}, source={row.get('source')}")
-                    skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
-                    atlanan += 1
-                    continue
-                from datetime import datetime
-                def force_json_str(val):
-                    import json
-                    if val is None or val == '' or val == []:
-                        return ''
-                    if isinstance(val, str):
-                        try:
-                            loaded = json.loads(val)
-                            if isinstance(loaded, list):
-                                return val
-                            else:
-                                return json.dumps([val], ensure_ascii=False)
-                        except Exception:
-                            return json.dumps([val], ensure_ascii=False)
-                    if isinstance(val, list):
-                        return json.dumps(val, ensure_ascii=False)
-                    return json.dumps([val], ensure_ascii=False)
-                # created_at alanını date nesnesine çevir
-                created_at_val = row.get('created_at')
-                created_at = None
-                if created_at_val:
-                    try:
-                        created_at = datetime.strptime(created_at_val, '%Y-%m-%d').date()
-                    except Exception:
-                        created_at = None
-                hadith = Hadith(
-                    hadis_id=row.get('hadis_id'),
-                    kitap=row.get('kitap'),
-                    bab=row.get('bab'),
-                    hadis_no=row.get('hadis_no'),
-                    arabic_text=row.get('arabic_text'),
-                    turkish_text=turkish_text,
-                    tags=force_json_str(row.get('tags')),
-                    topic=row.get('topic'),
-                    authenticity=row.get('authenticity'),
-                    narrator_chain=force_json_str(row.get('narrator_chain')),
-                    related_ayah=force_json_str(row.get('related_ayah')),
-                    context=row.get('context'),
-                    source=row.get('source'),
-                    reference=row.get('reference'),
-                    category=row.get('category'),
-                    language=row.get('language'),
-                    embedding=row.get('embedding'),
-                    created_at=created_at,
-                )
-                session.add(hadith)
-                new_hadiths.append(hadith)
-                print(f"EKLENİYOR (satır {idx}): hadis_id={row.get('hadis_id')}, turkish_text={str(turkish_text)[:30]}")
-                eklenen += 1
-            except Exception as e:
-                print(f"ATLANIYOR (satır {idx}): HATA: {e}\n{traceback.format_exc()}")
-                skipped.append({"row": idx, "reason": str(e)})
-                atlanan += 1
-        await session.commit()
-    print(f'CSV yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {atlanan}')
-    return {"status": "ok", "added": len(new_hadiths), "skipped": len(skipped), "skipped_details": skipped}
-
-@app.post("/admin/update_embeddings")
-async def update_embeddings(current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    from embedding_utils import update_hadith_embeddings
-    try:
-        updated_count = await update_hadith_embeddings()
-        logging.info(f"Embedding güncelleme tamamlandı: {updated_count} kayıt güncellendi")
-        return {"status": "ok", "updated_count": updated_count}
-    except Exception as e:
-        logging.exception("Admin embedding güncelleme HATASI")
-        raise HTTPException(status_code=500, detail="Embedding güncelleme hatası")
-
-@app.get("/admin/embedding_status")
-async def embedding_status(current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    from sqlalchemy import func
-    async with AsyncSessionLocal() as session:
-        total = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
-        with_emb = (await session.execute(select(func.count(Hadith.id)).where(Hadith.embedding.isnot(None)))).scalar_one()
-        without_emb = total - with_emb
-        return {
-            "total_hadiths": total,
-            "with_embedding": with_emb,
-            "without_embedding": without_emb,
-        }
-
-@app.post("/admin/import_tr_json")
-async def admin_import_tr_json(current_user: User = Depends(get_current_user)):
-    """hadiths_tr.json dosyasını veritabanına import eder."""
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    try:
-        backend_dir = os.path.abspath(os.path.dirname(__file__))
-        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
-        from import_hadiths import import_hadiths
-        inserted = await import_hadiths(tr_path)
-        return {"status": "ok", "inserted": inserted}
-    except Exception as e:
-        logging.exception("Admin TR JSON import HATASI")
-        raise HTTPException(status_code=500, detail="TR JSON import hatası")
-
-@app.post("/admin/import_ar_json")
-async def admin_import_ar_json(current_user: User = Depends(get_current_user)):
-    """hadiths_ar.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    try:
-        backend_dir = os.path.abspath(os.path.dirname(__file__))
-        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
-        if not os.path.exists(ar_path):
-            raise HTTPException(status_code=404, detail="AR JSON bulunamadı")
-        from import_hadiths import _merge_language_json
-        count = await _merge_language_json(ar_path, lang='ar')
-        return {"status": "ok", "processed": count}
-    except HTTPException:
-        raise
-    except Exception:
-        logging.exception("Admin AR JSON import HATASI")
-        raise HTTPException(status_code=500, detail="AR JSON import hatası")
-
-@app.post("/admin/import_en_json")
-async def admin_import_en_json(current_user: User = Depends(get_current_user)):
-    """hadiths_en.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    try:
-        backend_dir = os.path.abspath(os.path.dirname(__file__))
-        en_path = os.path.join(backend_dir, "hadiths_en.json")
-        if not os.path.exists(en_path):
-            raise HTTPException(status_code=404, detail="EN JSON bulunamadı")
-        from import_hadiths import _merge_language_json
-        count = await _merge_language_json(en_path, lang='en')
-        return {"status": "ok", "processed": count}
-    except HTTPException:
-        raise
-    except Exception:
-        logging.exception("Admin EN JSON import HATASI")
-        raise HTTPException(status_code=500, detail="EN JSON import hatası")
-
-@app.post("/admin/import_all_json")
-async def admin_import_all_json(current_user: User = Depends(get_current_user)):
-    """TR + AR + EN JSON’ları sırayla içeri alır ve birleştirir."""
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    try:
-        backend_dir = os.path.abspath(os.path.dirname(__file__))
-        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
-        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
-        en_path = os.path.join(backend_dir, "hadiths_en.json")
-        from import_hadiths import import_hadiths_all
-        processed = await import_hadiths_all(tr_path, ar_path=ar_path, en_path=en_path)
-        return {"status": "ok", "processed": processed}
-    except Exception:
-        logging.exception("Admin ALL JSON import HATASI")
-        raise HTTPException(status_code=500, detail="ALL JSON import hatası")
-
-@app.get("/admin/users")
-async def list_users(current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User))
-        users = result.scalars().all()
-        return [
-            {"id": u.id, "username": u.username, "email": u.email, "is_admin": u.is_admin, "is_premium": u.is_premium}
-            for u in users
-        ]
-
-@app.delete("/admin/user/delete")
-async def delete_user(user_id: int, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
-        await session.delete(user)
-        await session.commit()
-        return {"status": "deleted"}
-
-@app.post("/admin/user/premium")
-async def make_user_premium(user_id: int, action: str = "activate", days: int = 30, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
-        if action == "activate":
-            user.is_premium = True
-            from datetime import datetime, timedelta
-            user.premium_expiry = datetime.utcnow() + timedelta(days=days)
-            await session.commit()
-            return {"status": "premium_activated", "premium_expiry": user.premium_expiry.isoformat()}
-        elif action == "deactivate":
-            user.is_premium = False
-            user.premium_expiry = None
-            await session.commit()
-            return {"status": "premium_deactivated"}
-        else:
-            raise HTTPException(status_code=400, detail="Geçersiz action") 
-
-# --- İlim Yolculukları (Journey) Admin Endpointleri ---
-from pydantic import BaseModel
-
-class JourneyModuleCreate(BaseModel):
-    title: str
-    description: str = ''
-    icon: str = ''
-    category: str = ''
-    tags: str = ''
-
-class JourneyStepCreate(BaseModel):
-    module_id: int
-    title: str
-    order: int
-    content: str = ''
-    media_url: str = ''
-    media_type: str = ''
-    source: str = ''
-
-class StepReorderItem(BaseModel):
-    id: int
-    order: int
-
-class StepReorderRequest(BaseModel):
-    module_id: int
-    steps: List[StepReorderItem]
-
-class JourneyModuleUpdate(BaseModel):
-    id: int
-    title: Optional[str] = None
-    description: Optional[str] = None
-    icon: Optional[str] = None
-    category: Optional[str] = None
-    tags: Optional[str] = None
-
-class JourneyStepUpdate(BaseModel):
-    id: int
-    title: Optional[str] = None
-    order: Optional[int] = None
-    content: Optional[str] = None
-    media_url: Optional[str] = None
-    media_type: Optional[str] = None
-    source: Optional[str] = None
-
-@app.get('/admin/journey_modules')
-async def list_journey_modules(current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(JourneyModule).options(selectinload(JourneyModule.steps)))
-        modules = result.scalars().all()
-        return [
-            {
-                'id': m.id,
-                'title': m.title,
-                'description': m.description,
-                'icon': m.icon,
-                'category': m.category,
-                'tags': m.tags,
-                'steps': [
-                    {
-                        'id': s.id,
-                        'title': s.title,
-                        'order': s.order,
-                        'content': s.content,
-                        'media_url': s.media_url,
-                        'media_type': s.media_type,
-                        'source': s.source,
-                    }
-                    for s in sorted(m.steps, key=lambda x: x.order)
-                ]
-            } for m in modules
-        ]
-
-@app.post('/admin/journey_module')
-async def add_journey_module(req: JourneyModuleCreate, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        module = JourneyModule(title=req.title, description=req.description, icon=req.icon, category=req.category, tags=req.tags)
-        session.add(module)
-        await session.commit()
-        await session.refresh(module)
-        return {'id': module.id, 'title': module.title, 'category': module.category, 'tags': module.tags}
-
-@app.post('/admin/journey_step')
-async def add_journey_step(req: JourneyStepCreate, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        step = JourneyStep(
-            module_id=req.module_id,
-            title=req.title,
-            order=req.order,
-            content=req.content,
-            media_url=req.media_url,
-            media_type=req.media_type,
-            source=req.source,
-        )
-        session.add(step)
-        await session.commit()
-        await session.refresh(step)
-        return {'id': step.id, 'title': step.title}
-
-@app.post('/admin/journey_step/reorder')
-async def reorder_journey_steps(req: StepReorderRequest, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        for step in req.steps:
-            db_step = await session.get(JourneyStep, step.id)
-            if db_step and db_step.module_id == req.module_id:
-                db_step.order = step.order
-        await session.commit()
-    return {'status': 'ok'}
-
-@app.patch('/admin/journey_module/update')
-async def update_journey_module(req: JourneyModuleUpdate, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        module = await session.get(JourneyModule, req.id)
-        if not module:
-            raise HTTPException(status_code=404, detail='Modül bulunamadı')
-        if req.title is not None:
-            module.title = req.title
-        if req.description is not None:
-            module.description = req.description
-        if req.icon is not None:
-            module.icon = req.icon
-        if req.category is not None:
-            module.category = req.category
-        if req.tags is not None:
-            module.tags = req.tags
-        await session.commit()
-        await session.refresh(module)
-        return {
-            'id': module.id,
-            'title': module.title,
-            'description': module.description,
-            'icon': module.icon,
-            'category': module.category,
-            'tags': module.tags,
-        }
-
-@app.patch('/admin/journey_step/update')
-async def update_journey_step(req: JourneyStepUpdate, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        step = await session.get(JourneyStep, req.id)
-        if not step:
-            raise HTTPException(status_code=404, detail='Adım bulunamadı')
-        if req.title is not None:
-            step.title = req.title
-        if req.order is not None:
-            step.order = req.order
-        if req.content is not None:
-            step.content = req.content
-        if req.media_url is not None:
-            step.media_url = req.media_url
-        if req.media_type is not None:
-            step.media_type = req.media_type
-        if req.source is not None:
-            step.source = req.source
-        await session.commit()
-        await session.refresh(step)
-        return {
-            'id': step.id,
-            'title': step.title,
-            'order': step.order,
-            'content': step.content,
-            'media_url': step.media_url,
-            'media_type': step.media_type,
-            'source': step.source,
-        }
-
-@app.delete('/admin/journey_module')
-async def delete_journey_module(module_id: int, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        module = await session.get(JourneyModule, module_id)
-        if not module:
-            raise HTTPException(status_code=404, detail='Modül bulunamadı')
-        await session.delete(module)
-        await session.commit()
-        return {'status': 'deleted'}
-
-@app.delete('/admin/journey_step')
-async def delete_journey_step(step_id: int, current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
-    async with AsyncSessionLocal() as session:
-        step = await session.get(JourneyStep, step_id)
-        if not step:
-            raise HTTPException(status_code=404, detail='Adım bulunamadı')
-        await session.delete(step)
-        await session.commit()
-        return {'status': 'deleted'}
-
-# --- Kullanıcı Journey Progress Endpointleri ---
-class JourneyProgressUpdate(BaseModel):
-    module_id: int
-    completed_step: int
-
-@app.get('/user/journey_progress')
-async def get_journey_progress(current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(UserJourneyProgress).where(UserJourneyProgress.user_id == current_user.id))
-        progresses = result.scalars().all()
-        return [
-            {'module_id': p.module_id, 'completed_step': p.completed_step, 'completed_at': p.completed_at}
-            for p in progresses
-        ]
-
-@app.post('/user/journey_progress')
-async def update_journey_progress(req: JourneyProgressUpdate, current_user: User = Depends(get_current_user)):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(UserJourneyProgress).where((UserJourneyProgress.user_id == current_user.id) & (UserJourneyProgress.module_id == req.module_id)))
-        progress = result.scalar_one_or_none()
-        if progress:
-            progress.completed_step = req.completed_step
-        else:
-            progress = UserJourneyProgress(user_id=current_user.id, module_id=req.module_id, completed_step=req.completed_step)
-            session.add(progress)
-        await session.commit()
-        return {'module_id': req.module_id, 'completed_step': req.completed_step} 
-
-@app.get('/api/journey_modules')
-async def public_journey_modules(tags: list[str] = Query(None)):
-    print(f"[DEBUG] Gelen tags parametresi: {tags}")
-    async with AsyncSessionLocal() as session:
-        q = select(JourneyModule).options(selectinload(JourneyModule.steps))
-        if tags:
-            for tag in tags:
-                norm_tag = tag.strip().lower()
-                # REGEXP ile tam eşleşme (PostgreSQL)
-                try:
-                    q = q.where(JourneyModule.tags.op('~')(f',({norm_tag}),'))
-                except Exception:
-                    # Eğer REGEXP desteklenmiyorsa ilike ile başında ve sonunda virgül arayarak
-                    q = q.where(JourneyModule.tags.ilike(f'%,{norm_tag},%'))
-        print(f"[DEBUG] SQL sorgusu: {q}")
-        result = await session.execute(q)
-        modules = result.scalars().all()
-        return [
-            {
-                'id': m.id,
-                'title': m.title,
-                'description': m.description,
-                'icon': m.icon,
-                'category': m.category,
-                'tags': m.tags,
-                'steps': [
-                    {
-                        'id': s.id,
-                        'title': s.title,
-                        'order': s.order,
-                        'content': s.content,
-                        'media_url': s.media_url,
-                        'media_type': s.media_type,
-                        'source': s.source,
-                    } for s in m.steps
-                ]
-            } for m in modules
-        ] 
-
-@app.post('/admin/upload_journey_csv')
-async def upload_journey_csv(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail='Yetkisiz erişim')
+    filename = f"{current_user.id}_{uuid.uuid4().hex}.png"
+    filepath = os.path.join(_avatars_dir, filename)
+    # Dosyayı kaydet
     content = await file.read()
-    decoded = content.decode('utf-8').splitlines()
-    reader = csv.DictReader(decoded)
+    with open(filepath, "wb") as f:
+        f.write(content)
+    # Opsiyonel: boyutlandırma
+    if PIL_AVAILABLE:
+        try:
+            img = Image.open(filepath)
+            img = img.convert("RGBA") if img.mode != "RGBA" else img
+            img.thumbnail((512, 512))
+            img.save(filepath)
+        except Exception:
+            pass
+    # Profil güncelle
     async with AsyncSessionLocal() as session:
-        module_map = {}  # (title, description) -> module obj
-        for row in reader:
-            module_id = row.get('module_id')
-            module_title = row.get('module_title', '').strip()
-            module_desc = row.get('module_description', '').strip()
-            if module_id:
-                module = await session.get(JourneyModule, int(module_id))
-            else:
-                module = None
-            if not module and module_title:
-                # Aynı başlık ve açıklama ile modül var mı?
-                q = await session.execute(select(JourneyModule).where(JourneyModule.title == module_title))
-                module = q.scalars().first()
-                if not module:
-                    module = JourneyModule(title=module_title, description=module_desc, icon='explore')
-                    session.add(module)
-                    await session.flush()
-            if not module:
-                continue  # modül yoksa adım eklenemez
-            step = JourneyStep(
-                module_id=module.id,
-                title=row.get('step_title', '').strip(),
-                order=int(row.get('step_order', '1')),
-                content=row.get('step_content', '').strip(),
-                media_url=row.get('media_url', '').strip(),
-                media_type=row.get('media_type', '').strip(),
-                source=row.get('source', '').strip(),
-            )
-            session.add(step)
-        await session.commit()
-    return {'status': 'ok'} 
+        result = await session.execute(select(User).where(User.id == current_user.id))
+        user = result.scalar_one_or_none()
+        if user:
+            user.avatar_url = f"/static/avatars/{filename}"
+            await session.commit()
+    return {"avatar_url": f"/static/avatars/{filename}"}
 
-# Surah numarasını İngilizce sure adına çeviren mapping
-SURAH_ID_TO_NAME = {
-    1: "Al-Faatiha",
+# Kullanıcıya ait basit profil
+@app.get('/user/profile')
+async def profile(current_user: User = Depends(get_current_user)):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(User).where(User.id == current_user.id))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
+        return {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "avatar_url": user.avatar_url,
+            "is_premium": user.is_premium,
+        }
+
+# Basit yeniden yönlendirme
+@app.get("/")
+def root_redirect():
+    return RedirectResponse(url="/docs")
+
+# Runtime sırasında sequence onarımını güvence altına alan yardımcı
+async def _ensure_sequence(session: AsyncSession, table: str, column: str):
+    try:
+        seq_res = await session.execute(text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=table, col=column))
+        seq_name = seq_res.scalar()
+        if not seq_name:
+            fallback_seq = f"{table}_{column}_seq"
+            await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
+            await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {table}.{column}"))
+            await session.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
+            seq_name = fallback_seq
+        await session.execute(text("SELECT setval(:seq::regclass, COALESCE((SELECT MAX(" + column + ") FROM " + table + "), 0), TRUE)").bindparams(seq=seq_name))
+    except Exception:
+        # Sessizce yut, uygulama akışı devam etsin
+        pass
+
+QURAN_SURA_NAMES = {
+    1: "Al-Fatiha",
     2: "Al-Baqara",
-    3: "Aal-i-Imraan",
-    4: "An-Nisaa",
-    5: "Al-Maida",
-    6: "Al-An'aam",
-    7: "Al-A'raaf",
-    8: "Al-Anfaal",
-    9: "At-Tawba",
+    3: "Al-Imran",
+    4: "An-Nisa",
+    5: "Al-Ma'idah",
+    6: "Al-An'am",
+    7: "Al-A'raf",
+    8: "Al-Anfal",
+    9: "At-Tawbah",
     10: "Yunus",
     11: "Hud",
     12: "Yusuf",
@@ -1518,60 +772,60 @@ SURAH_ID_TO_NAME = {
     14: "Ibrahim",
     15: "Al-Hijr",
     16: "An-Nahl",
-    17: "Al-Israa",
+    17: "Al-Isra",
     18: "Al-Kahf",
     19: "Maryam",
     20: "Ta-Ha",
     21: "Al-Anbiya",
     22: "Al-Hajj",
-    23: "Al-Mu'minoon",
-    24: "An-Noor",
+    23: "Al-Mu'minun",
+    24: "An-Nur",
     25: "Al-Furqan",
     26: "Ash-Shu'ara",
     27: "An-Naml",
     28: "Al-Qasas",
-    29: "Al-Ankaboot",
+    29: "Al-Ankabut",
     30: "Ar-Rum",
     31: "Luqman",
     32: "As-Sajda",
-    33: "Al-Ahzaab",
+    33: "Al-Ahzab",
     34: "Saba",
-    35: "Faatir",
-    36: "Yaseen",
-    37: "As-Saaffaat",
-    38: "Saad",
+    35: "Fatir",
+    36: "Ya-Sin",
+    37: "As-Saffat",
+    38: "Sad",
     39: "Az-Zumar",
     40: "Ghafir",
     41: "Fussilat",
     42: "Ash-Shura",
     43: "Az-Zukhruf",
-    44: "Ad-Dukhaan",
-    45: "Al-Jaathiya",
+    44: "Ad-Dukhan",
+    45: "Al-Jathiya",
     46: "Al-Ahqaf",
     47: "Muhammad",
     48: "Al-Fath",
-    49: "Al-Hujuraat",
-    50: "Qaaf",
-    51: "Adh-Dhaariyat",
+    49: "Al-Hujurat",
+    50: "Qaf",
+    51: "Adh-Dhariyat",
     52: "At-Tur",
     53: "An-Najm",
     54: "Al-Qamar",
     55: "Ar-Rahman",
-    56: "Al-Waqia",
+    56: "Al-Waqi'a",
     57: "Al-Hadid",
     58: "Al-Mujadila",
     59: "Al-Hashr",
     60: "Al-Mumtahina",
     61: "As-Saff",
-    62: "Al-Jumua",
-    63: "Al-Munafiqoon",
+    62: "Al-Jumu'a",
+    63: "Al-Munafiqun",
     64: "At-Taghabun",
     65: "At-Talaq",
     66: "At-Tahrim",
     67: "Al-Mulk",
     68: "Al-Qalam",
-    69: "Al-Haaqqa",
-    70: "Al-Maarij",
+    69: "Al-Haqqah",
+    70: "Al-Ma'arij",
     71: "Nuh",
     72: "Al-Jinn",
     73: "Al-Muzzammil",
@@ -1620,543 +874,243 @@ SURAH_ID_TO_NAME = {
 
 @app.get('/api/quran')
 async def get_quran(surah: str = None, ayah: int = None, language: str = 'tr', q: str = None, reciter: str = None):
-    async with AsyncSessionLocal() as session:
-        surah_param = surah
-        if surah and surah.isdigit():
-            surah_param = SURAH_ID_TO_NAME.get(int(surah))
-        query = select(QuranVerse)
-        if surah_param:
-            query = query.where(QuranVerse.surah == surah_param)
-        if ayah:
-            query = query.where(QuranVerse.ayah == ayah)
-        if language:
-            query = query.where(QuranVerse.language == language)
-        if q:
-            query = query.where(QuranVerse.text.ilike(f'%{q}%'))
-        result = await session.execute(query)
-        verses = result.scalars().all()
-        import re
-
-        def build_audio_url(v, reciter_code: str | None):
-            if not reciter_code:
-                return None
-            # Varsayılan: DB’deki audio_url’den global ayet numarasını çıkar, yoksa ayah_number’a düş.
-            global_num = None
-            if getattr(v, 'audio_url', None):
-                m = re.search(r"/(\d+)\.mp3$", v.audio_url)
-                if m:
-                    try:
-                        global_num = int(m.group(1))
-                    except Exception:
-                        global_num = None
-            verse_num = global_num or getattr(v, 'ayah_number', None) or getattr(v, 'ayah', None)
-            if not verse_num:
-                return None
-            return f'https://cdn.islamic.network/quran/audio/128/{reciter_code}/{verse_num}.mp3'
-
-        # Eğer DB’de veri yoksa, ilgili sureyi dış API’den getirerek zarif ve non-blocking bir fallback uygula.
-        if not verses and (surah or q or ayah):
-            try:
-                import httpx
-                # Surah ID’yi bul
-                surah_id = None
-                if surah and surah.isdigit():
-                    surah_id = int(surah)
-                elif surah_param:
-                    # isimden ID’ye ters map
-                    for sid, sname in SURAH_ID_TO_NAME.items():
-                        if sname.lower() == str(surah_param).lower():
-                            surah_id = sid
-                            break
-                if not surah_id:
-                    # Surah verilmemişse veya çözülemediyse, kısa bir sure ile örnek döndür (İhlas)
-                    surah_id = 112
-
-                ayahs_ar: list = []
-                data_ar: dict = {}
-                ayahs_tr_map: dict[int, str] = {}
-
-                async with httpx.AsyncClient(timeout=15) as client:
-                    # Arapça metin ve ses
-                    base_url_ar = f'https://api.alquran.cloud/v1/surah/{surah_id}/ar.alafasy'
-                    try:
-                        r_ar = await client.get(base_url_ar)
-                        if r_ar.status_code == 200:
-                            data_ar = r_ar.json().get('data', {})
-                            ayahs_ar = data_ar.get('ayahs', []) or []
-                        else:
-                            ayahs_ar = []
-                    except Exception as e:
-                        print('[quran fallback] AR fetch hatası:', str(e))
-                        ayahs_ar = []
-
-                    # İstenen dil Türkçe ise meal eklemeyi dene
-                    if (language or '').lower().startswith('tr'):
-                        base_url_tr = f'https://api.alquran.cloud/v1/surah/{surah_id}/tr.yildirim'
-                        try:
-                            r_tr = await client.get(base_url_tr)
-                            if r_tr.status_code == 200:
-                                data_tr = r_tr.json().get('data', {})
-                                for a in data_tr.get('ayahs', []) or []:
-                                    try:
-                                        ayahs_tr_map[int(a.get('numberInSurah', 0))] = a.get('text')
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            print('[quran fallback] TR fetch hatası:', str(e))
-
-                # Fallback sonucu
-                fallback = []
-                surah_name_from_api = data_ar.get('englishName') or data_ar.get('name')
-                for a in ayahs_ar:
-                    try:
-                        num_in_surah = int(a.get('numberInSurah', 0))
-                    except Exception:
-                        num_in_surah = a.get('numberInSurah') or a.get('ayah_number') or a.get('ayah') or None
-                    text_ar = a.get('text')
-                    audio_url = a.get('audio')
-                    tr_text = ayahs_tr_map.get(num_in_surah)
-                    item = {
-                        'id': None,
-                        'surah': surah_name_from_api,
-                        'ayah': num_in_surah,
-                        'text': text_ar,
-                        'translation': tr_text,
-                        'language': (language or 'tr'),
-                        'surah_id': surah_id,
-                        'surah_name': surah_name_from_api,
-                        'ayah_number': num_in_surah,
-                        'text_ar': text_ar,
-                        'text_tr': tr_text,
-                        'audio_url': audio_url,
+    try:
+        async with AsyncSessionLocal() as session:
+            query = select(QuranVerse)
+            if surah:
+                query = query.where(QuranVerse.surah == surah)
+            if ayah:
+                query = query.where(QuranVerse.ayah == ayah)
+            if language:
+                query = query.where(QuranVerse.language == language)
+            if q:
+                query = query.where(QuranVerse.text.ilike(f"%{q}%"))
+            result = await session.execute(query)
+            verses = result.scalars().all()
+            items = [
+                {
+                    "surah": v.surah,
+                    "ayah": v.ayah,
+                    "text": v.text,
+                    "language": v.language
+                }
+                for v in verses
+            ]
+            # Opsiyonel: ses dosyalarını döndür
+            if reciter:
+                audio_query = select(QuranAudio).where(QuranAudio.reciter == reciter)
+                audio_result = await session.execute(audio_query)
+                audio_items = [
+                    {
+                        "surah": a.surah,
+                        "ayah": a.ayah,
+                        "url": a.url
                     }
-                    # Reciter istendiyse global numaraya göre ses URL’sini üret
-                    if reciter:
-                        try:
-                            # alquran.cloud yanıtındaki 'number' global ayet numarasıdır
-                            global_num = int(a.get('number')) if a.get('number') else None
-                        except Exception:
-                            global_num = None
-                        if global_num:
-                            item['audio_url'] = f'https://cdn.islamic.network/quran/audio/128/{reciter}/{global_num}.mp3'
-                    fallback.append(item)
-
-                # İsteğe bağlı: küçük bir cache olarak DB’ye yaz (yalnızca boşken ve bir sure istenmişse)
-                try:
-                    if fallback and surah_id:
-                        async with AsyncSessionLocal() as s2:
-                            for it in fallback:
-                                s2.add(QuranVerse(
-                                    surah=it['surah_name'] or it['surah'] or str(surah_id),
-                                    ayah=it['ayah'],
-                                    text=it['text_ar'] or it['text'],
-                                    translation=it['text_tr'],
-                                    language=it['language'],
-                                    surah_id=surah_id,
-                                    surah_name=it['surah_name'] or it['surah'],
-                                    ayah_number=it['ayah'],
-                                    text_ar=it['text_ar'],
-                                    text_tr=it['text_tr'],
-                                    audio_url=it['audio_url'],
-                                ))
-                            await s2.commit()
-                except Exception as e:
-                    print('[quran seed fallback] yazma hatası:', str(e))
-                return fallback
-            except Exception as e:
-                print('[quran fallback] exception:', str(e))
-                # Sessizce boş dön, istemci tarafı kullanıcıya uygun mesaj gösterebilir
-                return []
-
-        return [
-            {
-                'id': v.id,
-                'surah': v.surah,
-                'ayah': v.ayah,
-                'text': v.text,
-                'translation': v.translation,
-                'language': v.language,
-                'surah_id': v.surah_id,
-                'surah_name': v.surah_name,
-                'ayah_number': v.ayah_number,
-                'text_ar': v.text_ar,
-                'text_tr': v.text_tr,
-                # Eğer reciter verilmişse doğru global ayet numarasını kullanarak URL üret, aksi halde DB’deki mevcut URL’yi bırak.
-                'audio_url': build_audio_url(v, reciter) if reciter else (v.audio_url or None)
-            } for v in verses
-        ]
+                    for a in audio_result.scalars().all()
+                ]
+                return {"items": items, "audio": audio_items}
+            return {"items": items}
+    except Exception:
+        logging.exception("Kuran ayetleri çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
 @app.get('/api/dua')
 async def get_dua(category: str = None, language: str = 'tr', q: str = None):
-    async with AsyncSessionLocal() as session:
-        query = select(Dua)
-        if category:
-            query = query.where(Dua.category == category)
-        if language:
-            query = query.where(Dua.language == language)
-        if q:
-            query = query.where(Dua.text.ilike(f'%{q}%'))
-        result = await session.execute(query)
-        duas = result.scalars().all()
-        return [
-            {
-                'id': d.id,
-                'title': d.title,
-                'text': d.text,
-                'translation': d.translation,
-                'category': d.category,
-                'language': d.language
-            } for d in duas
-        ]
+    try:
+        async with AsyncSessionLocal() as session:
+            query = select(Dua)
+            if category:
+                query = query.where(Dua.category == category)
+            if language:
+                query = query.where(Dua.language == language)
+            if q:
+                query = query.where(Dua.text.ilike(f"%{q}%"))
+            result = await session.execute(query)
+            duas = result.scalars().all()
+            items = [
+                {
+                    "category": d.category,
+                    "text": d.text,
+                    "language": d.language
+                }
+                for d in duas
+            ]
+            return {"items": items}
+    except Exception:
+        logging.exception("Dua çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
 @app.get('/api/zikr')
 async def get_zikr(category: str = None, language: str = 'tr', q: str = None):
-    async with AsyncSessionLocal() as session:
-        query = select(Zikr)
-        if category:
-            query = query.where(Zikr.category == category)
-        if language:
-            query = query.where(Zikr.language == language)
-        if q:
-            query = query.where(Zikr.text.ilike(f'%{q}%'))
-        result = await session.execute(query)
-        zikrs = result.scalars().all()
-        return [
-            {
-                'id': z.id,
-                'title': z.title,
-                'text': z.text,
-                'translation': z.translation,
-                'count': z.count,
-                'category': z.category,
-                'language': z.language
-            } for z in zikrs
-        ]
+    try:
+        async with AsyncSessionLocal() as session:
+            query = select(Zikr)
+            if category:
+                query = query.where(Zikr.category == category)
+            if language:
+                query = query.where(Zikr.language == language)
+            if q:
+                query = query.where(Zikr.text.ilike(f"%{q}%"))
+            result = await session.execute(query)
+            zikrs = result.scalars().all()
+            items = [
+                {
+                    "category": z.category,
+                    "text": z.text,
+                    "language": z.language
+                }
+                for z in zikrs
+            ]
+            return {"items": items}
+    except Exception:
+        logging.exception("Zikr çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
 @app.get('/api/tefsir')
 async def get_tefsir(surah: str = None, ayah: int = None, author: str = None, language: str = 'tr', q: str = None):
-    async with AsyncSessionLocal() as session:
-        query = select(Tafsir)
-        if surah:
-            query = query.where(Tafsir.surah == surah)
-        if ayah:
-            query = query.where(Tafsir.ayah == ayah)
-        if author:
-            query = query.where(Tafsir.author == author)
-        if language:
-            query = query.where(Tafsir.language == language)
-        if q:
-            query = query.where(Tafsir.text.ilike(f'%{q}%'))
-        result = await session.execute(query)
-        tafsirs = result.scalars().all()
-        return [
-            {
-                'id': t.id,
-                'surah': t.surah,
-                'ayah': t.ayah,
-                'text': t.text,
-                'author': t.author,
-                'language': t.language
-            } for t in tafsirs
-        ] 
+    try:
+        async with AsyncSessionLocal() as session:
+            query = select(Tafsir)
+            if surah:
+                query = query.where(Tafsir.surah == surah)
+            if ayah:
+                query = query.where(Tafsir.ayah == ayah)
+            if author:
+                query = query.where(Tafsir.author == author)
+            if language:
+                query = query.where(Tafsir.language == language)
+            if q:
+                query = query.where(Tafsir.text.ilike(f"%{q}%"))
+            result = await session.execute(query)
+            tafsirs = result.scalars().all()
+            items = [
+                {
+                    "author": t.author,
+                    "surah": t.surah,
+                    "ayah": t.ayah,
+                    "text": t.text,
+                    "language": t.language
+                }
+                for t in tafsirs
+            ]
+            return {"items": items}
+    except Exception:
+        logging.exception("Tefsir çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
 @app.get('/api/reciters')
 async def get_reciters():
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(models.Reciter))
-        reciters = result.scalars().all()
-        return [
-            {
-                'id': r.id,
-                'name': r.name,
-                'description': r.description
-            } for r in reciters
-        ] 
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(QuranAudio.reciter).distinct())
+            reciters = [r[0] for r in result.all()]
+            items = [
+                {
+                    "name": r,
+                }
+                for r in reciters
+            ]
+            return {"items": items}
+    except Exception:
+        logging.exception("Kıraatçılar çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
-# Günün Ayeti (SQL’den deterministik seçim)
 @app.get('/api/daily_ayah')
 async def get_daily_ayah(language: str = 'tr'):
-    from sqlalchemy import func
-    from datetime import datetime
-    async with AsyncSessionLocal() as session:
-        # Toplam ayet sayısı (dil filtresiyle)
-        count_res = await session.execute(
-            select(func.count()).where(QuranVerse.language == language)
-        )
-        total = count_res.scalar() or 0
-        if total == 0:
-            return { 'text': '', 'reference': '' }
-        # Yılın günü ile deterministik index
-        day_idx = datetime.utcnow().timetuple().tm_yday % total
-        verse_res = await session.execute(
-            select(QuranVerse)
-            .where(QuranVerse.language == language)
-            .order_by(QuranVerse.id)
-            .offset(day_idx)
-            .limit(1)
-        )
-        v = verse_res.scalars().first()
-        if not v:
-            return { 'text': '', 'reference': '' }
-        return {
-            'text': getattr(v, 'text', None) or getattr(v, 'text_tr', None) or '',
-            'reference': f"{getattr(v, 'surah', '')} {getattr(v, 'ayah', '')}"
-        }
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(QuranVerse).order_by(QuranVerse.created_at.desc()))
+            verse = result.scalars().first()
+            if not verse:
+                return JSONResponse(status_code=404, content={"detail": "Ayet bulunamadı"})
+            return {
+                "surah": verse.surah,
+                "ayah": verse.ayah,
+                "text": verse.text,
+                "language": verse.language
+            }
+    except Exception:
+        logging.exception("Günlük ayet çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
-# Günün Hadisi (SQL’den deterministik seçim)
 @app.get('/api/daily_hadith')
 async def get_daily_hadith(language: str = 'tr'):
-    from sqlalchemy import func
-    from datetime import datetime
-    async with AsyncSessionLocal() as session:
-        count_res = await session.execute(
-            select(func.count()).where(Hadith.language == language)
-        )
-        total = count_res.scalar() or 0
-        if total == 0:
-            return { 'text': '', 'reference': '' }
-        day_idx = datetime.utcnow().timetuple().tm_yday % total
-        hadith_res = await session.execute(
-            select(Hadith)
-            .where(Hadith.language == language)
-            .order_by(Hadith.id)
-            .offset(day_idx)
-            .limit(1)
-        )
-        h = hadith_res.scalars().first()
-        if not h:
-            return { 'text': '', 'reference': '' }
-        # Hadis metni alan önceliği
-        text_val = (
-            getattr(h, 'turkish_text', None)
-            or getattr(h, 'text_tr', None)
-            or getattr(h, 'text', None)
-            or getattr(h, 'english_text', None)
-            or getattr(h, 'arabic_text', None)
-            or ''
-        )
-        ref = (
-            f"{getattr(h, 'source', '')} {getattr(h, 'reference', '')}"
-        ).strip()
-        return {
-            'text': text_val,
-            'reference': ref,
-        }
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(Hadith).order_by(Hadith.id.desc()))
+            hadith = result.scalars().first()
+            if not hadith:
+                return JSONResponse(status_code=404, content={"detail": "Hadis bulunamadı"})
+            return {
+                "text": hadith.text,
+                "source": hadith.source,
+                "reference": hadith.reference,
+                "language": hadith.language
+            }
+    except Exception:
+        logging.exception("Günlük hadis çekme hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
 
 @app.get('/user/profile')
 async def get_user_profile(current_user: User = Depends(get_current_user)):
-    return {
-        "username": current_user.username,
-        "email": current_user.email,
-        "is_admin": current_user.is_admin,
-        "isPremium": current_user.is_premium,
-        "premium_expiry": current_user.premium_expiry.isoformat() if current_user.premium_expiry else None,
-        "theme_preference": current_user.theme_preference or "light",
-        "avatar_url": current_user.avatar_url or None,
-    }
-
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(User).where(User.id == current_user.id))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
+        return {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "avatar_url": user.avatar_url,
+            "is_premium": user.is_premium,
+        }
 
 def safe_json_field(val):
-    if val is None or val == "" or val == []:
-        return ""
-    if isinstance(val, list):
-        return json.dumps(val, ensure_ascii=False)
-    return str(val)
-# -------------------------
-# Yakın Camiler & Rota API
-# -------------------------
+    try:
+        return json.loads(val)
+    except Exception:
+        return None
 
 def _google_api_key() -> str:
-    key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-    # Anahtar yoksa artık 500 fırlatmayıp boş döneceğiz; çağıran fonksiyon zarifçe boş liste ile yanıtlar.
-    return key
+    return os.getenv('GOOGLE_MAPS_API_KEY') or ''
 
 @app.get("/api/mosques/nearby")
 def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: float = Query(3.0, description="km cinsinden")):
-    """Yakındaki camileri döndürür.
-    Öncelik Google Places; API anahtarı yoksa veya hata alınırsa Overpass (OSM) fallback kullanılır.
-    """
-    def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        R = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
-        a = sin(dlat/2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2) ** 2
-        c = 2 * atan2(a ** 0.5, (1 - a) ** 0.5)
-        return R * c
-
-    radius_m = int(max(0.1, radius) * 1000)
     api_key = _google_api_key()
-
-    # 1) Google Places dene
-    if api_key:
-        url = (
-            f"https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-            f"?location={lat},{lng}&radius={radius_m}&type=mosque&key={api_key}"
-        )
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                results = data.get("results", [])
-                mosques = []
-                for item in results:
-                    geom = item.get("geometry", {}).get("location", {})
-                    mlat = float(geom.get("lat", 0.0))
-                    mlon = float(geom.get("lng", 0.0))
-                    mosques.append({
-                        "id": item.get("place_id") or item.get("id") or "",
-                        "name": item.get("name", "Cami"),
-                        "latitude": mlat,
-                        "longitude": mlon,
-                        "address": item.get("vicinity") or item.get("formatted_address"),
-                        "rating": (item.get("rating") or None),
-                        "photo_reference": (item.get("photos", [{}])[0].get("photo_reference") if item.get("photos") else None),
-                        "distance_km": round(haversine_km(lat, lng, mlat, mlon), 2),
-                    })
-                return mosques
-            else:
-                print("[nearby_mosques] Google non-200:", r.status_code, r.text[:200])
-        except Exception as e:
-            print("[nearby_mosques] Google exception:", str(e))
-
-    # 2) Overpass (OSM) fallback
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Google Maps API anahtarı eksik")
+    # km → metre
+    radius_m = float(radius) * 1000.0
+    # Google Places API çağrısı
+    url = (
+        "https://maps.googleapis.com/maps/api/place/nearbysearch/json?" +
+        urllib.parse.urlencode({
+            "location": f"{lat},{lng}",
+            "radius": int(radius_m),
+            "type": "mosque",
+            "key": api_key
+        })
+    )
     try:
-        overpass_url = "https://overpass-api.de/api/interpreter"
-        # amenity=place_of_worship ve religion=muslim filtreleriyle çevredeki noktaları al
-        query = (
-            f"[out:json];"
-            f"node(around:{radius_m},{lat},{lng})[\"amenity\"=\"place_of_worship\"][\"religion\"=\"muslim\"];"
-            f"out center;"
-        )
-        resp = requests.post(overpass_url, data=query, timeout=20)
-        if resp.status_code != 200:
-            print("[nearby_mosques] Overpass non-200:", resp.status_code, resp.text[:200])
-            return []
-        payload = resp.json()
-        elements = payload.get("elements", [])
-        mosques = []
-        for el in elements:
-            mlat = float(el.get("lat", el.get("center", {}).get("lat", 0.0)))
-            mlon = float(el.get("lon", el.get("center", {}).get("lon", 0.0)))
-            name = (el.get("tags", {}) or {}).get("name") or "Cami"
-            mosques.append({
-                "id": str(el.get("id") or ""),
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        items = []
+        for p in data.get("results", []):
+            name = p.get("name")
+            geo = p.get("geometry", {}).get("location", {})
+            plat = geo.get("lat")
+            plng = geo.get("lng")
+            rating = p.get("rating")
+            vicinity = p.get("vicinity")
+            items.append({
                 "name": name,
-                "latitude": mlat,
-                "longitude": mlon,
-                "address": (el.get("tags", {}) or {}).get("addr:full") or None,
-                "rating": None,
-                "photo_reference": None,
-                "distance_km": round(haversine_km(lat, lng, mlat, mlon), 2),
+                "lat": plat,
+                "lng": plng,
+                "rating": rating,
+                "vicinity": vicinity
             })
-        return mosques
-    except Exception as e:
-        print("[nearby_mosques] Overpass exception:", str(e))
-        return []
-
-@app.get("/api/mosques/photo")
-def mosque_photo(ref: str = Query(..., description="Google Places photo_reference"), maxwidth: int = Query(400)):
-    """Google Places Photo için güvenli proxy: API anahtarını istemciye sızdırmadan fotoğrafa yönlendirir."""
-    api_key = _google_api_key()
-    if not ref:
-        raise HTTPException(status_code=400, detail="ref gerekli")
-    url = (
-        "https://maps.googleapis.com/maps/api/place/photo"
-        f"?maxwidth={maxwidth}&photoreference={ref}&key={api_key}"
-    )
-    return RedirectResponse(url=url)
-
-@app.get("/api/directions")
-def directions(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float, mode: str = "driving"):
-    """Google Directions ile rota bilgisini döndürür (sunucu tarafı proxy)."""
-    api_key = _google_api_key()
-    url = (
-        f"https://maps.googleapis.com/maps/api/directions/json"
-        f"?origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&mode={mode}&key={api_key}"
-    )
-    r = requests.get(url, timeout=10)
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
-
-# --- Kıble Yönü ---
-def _initial_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """(lat1, lon1) -> (lat2, lon2) için başlangıç açısını (true North'a göre derece) hesaplar."""
-    phi1, phi2 = radians(lat1), radians(lat2)
-    d_lambda = radians(lon2 - lon1)
-    x = sin(d_lambda) * cos(phi2)
-    y = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(d_lambda)
-    bearing = (degrees(atan2(x, y)) + 360.0) % 360.0
-    return bearing
-
-@app.get("/api/qibla_direction")
-def qibla_direction(lat: float = Query(...), lng: float = Query(...)):
-    """Verilen konumdan Kıble yönü: true North referanslı derece döndürür."""
-    kaaba_lat, kaaba_lng = 21.4225, 39.8262
-    b = _initial_bearing(lat, lng, kaaba_lat, kaaba_lng)
-    return {
-        "bearing_deg": round(b, 2),
-        "origin": {"lat": lat, "lng": lng},
-        "kaaba": {"lat": kaaba_lat, "lng": kaaba_lng},
-    }
-
-# --- Namaz Vakitleri Proxy ---
-@app.get("/api/prayer_times")
-def prayer_times(city: str, country: str = "Turkey", method: int = 2):
-    """Aladhan API üzerinden şehir bazlı namaz vakitlerini döndürür.
-    Frontend şehir adını gönderir; backend proxy olarak dış API ile konuşur.
-    """
-    try:
-        city_q = urllib.parse.quote(city)
-        country_q = urllib.parse.quote(country)
-        url = (
-            f"https://api.aladhan.com/v1/timingsByCity?city={city_q}&country={country_q}&method={method}"
-        )
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-        if not isinstance(data, dict) or "data" not in data:
-            raise HTTPException(status_code=500, detail="Geçersiz yanıt")
-        d = data["data"]
-        return {
-            "city": city,
-            "country": country,
-            "date": d.get("date", {}),
-            "timings": d.get("timings", {}),
-            "meta": d.get("meta", {}),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def _get_sequence_name(session, tbl: str, col: str) -> str:
-    # Sequence adını bulur; yoksa oluşturup bağlar ve döner
-    seq_res = await session.execute(
-        text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=tbl, col=col)
-    )
-    seq_name = seq_res.scalar()
-    if not seq_name:
-        default_res = await session.execute(text(
-            """
-            SELECT column_default
-            FROM information_schema.columns
-            WHERE table_name = :tbl AND column_name = :col
-            """
-        ).bindparams(tbl=tbl, col=col))
-        column_default = default_res.scalar()
-        if column_default and 'nextval' in column_default:
-            try:
-                start = column_default.find("'")
-                end = column_default.find("'", start + 1)
-                seq_name = column_default[start+1:end]
-            except Exception:
-                seq_name = None
-    if not seq_name:
-        fallback_seq = f"{tbl}_{col}_seq"
-        await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
-        await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {tbl}.{col}"))
-        await session.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
-        seq_name = fallback_seq
-    return seq_name
+        return {"items": items}
+    except Exception:
+        logging.exception("Cami arama hatası")
+        raise HTTPException(status_code=500, detail="Bir hata oluştu")
