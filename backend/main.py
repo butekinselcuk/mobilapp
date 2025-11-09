@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from database import engine, Base
@@ -1244,43 +1244,8 @@ SURAH_ID_TO_NAME = {
     111: "Al-Masad", 112: "Al-Ikhlas", 113: "Al-Falaq", 114: "An-Nas"
 }
 
-@app.get('/api/quran')
-async def get_quran(surah: str = None, ayah: int = None, language: str = 'tr', q: str = None, reciter: str = None):
-    async with AsyncSessionLocal() as session:
-        query = select(QuranVerse)
-        if surah:
-            try:
-                surah_num = int(surah)
-                surah_name = SURAH_ID_TO_NAME.get(surah_num)
-                if surah_name:
-                    query = query.where(or_(QuranVerse.surah == surah_name, QuranVerse.surah == str(surah_num)))
-                else:
-                    query = query.where(or_(QuranVerse.surah == str(surah_num)))
-            except ValueError:
-                query = query.where(QuranVerse.surah == surah)
-        if ayah is not None:
-            query = query.where(QuranVerse.ayah == ayah)
-        if language:
-            query = query.where(QuranVerse.language == language)
-        if q:
-            like = f"%{q}%"
-            query = query.where(QuranVerse.text.ilike(like))
-        res = await session.execute(query)
-        verses = res.scalars().all()
-        def build_audio(v):
-            if not reciter:
-                return None
-            return f"https://cdn.quran.audio/{reciter}/{v.surah}/{v.ayah}.mp3"
-        return [
-            {
-                "surah": v.surah,
-                "ayah": v.ayah,
-                "text": v.text,
-                "language": v.language,
-                "audio_url": build_audio(v)
-            }
-            for v in verses
-        ]
+# /api/quran endpointi composite_app içinde tanımlıdır.
+# Buradaki tekrar tanımı kaldırıldı; böylece DB boşsa AlQuran Cloud fallback çalışır.
 
 @app.get('/api/dua')
 async def get_dua(category: str = None, language: str = 'tr', q: str = None):
@@ -1457,32 +1422,42 @@ def _overpass_mosques(lat: float, lng: float, radius_km: float = 3.0, retries: i
 
 @app.get("/api/mosques/nearby")
 def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: float = Query(3.0, description="km cinsinden")):
-    key = _google_api_key()
-    if not key:
-        # Google anahtarı yoksa Overpass fallback
-        mosques = _overpass_mosques(lat, lng, radius)
-        return {"mosques": mosques}
-    url = (
-        "https://maps.googleapis.com/maps/api/place/nearbysearch/json?"
-        f"location={lat},{lng}&radius={int(radius*1000)}&type=mosque&key={key}"
-    )
     try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        results = data.get('results', [])
-        mosques = []
-        for r in results:
-            name = r.get('name')
-            vicinity = r.get('vicinity')
-            loc = r.get('geometry', {}).get('location', {})
-            mlat = loc.get('lat')
-            mlng = loc.get('lng')
-            mosques.append({"name": name, "vicinity": vicinity, "lat": mlat, "lng": mlng})
-        # Google sonuçları boşsa Overpass fallback dene
-        if not mosques:
+        key = _google_api_key()
+        if not key:
+            # Google anahtarı yoksa Overpass fallback
             mosques = _overpass_mosques(lat, lng, radius)
-        return {"mosques": mosques}
-    except Exception as e:
-        logging.exception("Yakın camiler API hatası, Overpass fallback deneniyor")
-        mosques = _overpass_mosques(lat, lng, radius)
-        return {"mosques": mosques}
+            return {"mosques": mosques}
+
+        url = (
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json?"
+            f"location={lat},{lng}&radius={int(radius*1000)}&type=mosque&key={key}"
+        )
+
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            results = data.get('results', [])
+            mosques = []
+            for r in results:
+                name = r.get('name')
+                vicinity = r.get('vicinity')
+                loc = r.get('geometry', {}).get('location', {})
+                mlat = loc.get('lat')
+                mlng = loc.get('lng')
+                mosques.append({"name": name, "vicinity": vicinity, "lat": mlat, "lng": mlng})
+            # Google sonuçları boşsa Overpass fallback dene
+            if not mosques:
+                mosques = _overpass_mosques(lat, lng, radius)
+            return {"mosques": mosques}
+        except Exception:
+            logging.exception("Yakın camiler API hatası, Overpass fallback deneniyor")
+            mosques = _overpass_mosques(lat, lng, radius)
+            return {"mosques": mosques}
+    except Exception as outer:
+        logging.exception("Yakın camiler endpoint genel hata: %s", str(outer))
+        try:
+            mosques = _overpass_mosques(lat, lng, radius)
+            return {"mosques": mosques}
+        except Exception:
+            return {"mosques": []}
