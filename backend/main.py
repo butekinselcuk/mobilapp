@@ -30,7 +30,6 @@ import csv
 from models import JourneyModule, JourneyStep, UserJourneyProgress
 from fastapi import Body
 from models import QuranVerse, Dua, Zikr, Tafsir, QuranAudio
-from models import Mosque
 import json
 import httpx
 from textwrap import shorten
@@ -357,7 +356,7 @@ async def create_or_get_session(request: SessionRequest, current_user: User = De
             print("[RT-SEQ-FIX] chat_sessions.id sequence kontrol/onarım atlandı")
         if request.session_token:
             # Mevcut session'ı bul
-            result = await session execute(
+            result = await session.execute(
                 select(ChatSession).options(selectinload(ChatSession.messages))
                 .where(ChatSession.session_token == request.session_token)
             )
