@@ -1417,11 +1417,51 @@ def safe_json_field(val):
 def _google_api_key() -> str:
     return os.getenv('GOOGLE_API_KEY', '')
 
+def _overpass_mosques(lat: float, lng: float, radius_km: float = 3.0, retries: int = 3, timeout: int = 12):
+    endpoints = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+    ]
+    radius_m = max(int(radius_km * 1000), 500)
+    def build_query(rm: int) -> str:
+        return (
+            f"[out:json];node(around:{rm},{lat},{lng})[\"amenity\"=\"place_of_worship\"][\"religion\"=\"muslim\"];out center;"
+        )
+    last_err = None
+    for i in range(retries):
+        ep = endpoints[i % len(endpoints)]
+        try:
+            resp = requests.post(ep, data=build_query(radius_m), timeout=timeout)
+            if resp.status_code >= 500:
+                radius_m = max(int(radius_m * 0.7), 1000)
+                continue
+            data = resp.json()
+            elements = data.get('elements', [])
+            mosques = []
+            for el in elements:
+                center = el.get('center', {})
+                mlat = el.get('lat', center.get('lat'))
+                mlng = el.get('lon', center.get('lon'))
+                tags = el.get('tags', {})
+                name = tags.get('name', 'Cami')
+                vicinity = ' '.join(filter(None, [tags.get('addr:street'), tags.get('addr:housenumber'), tags.get('addr:city')])) or None
+                if mlat is not None and mlng is not None:
+                    mosques.append({"name": name, "vicinity": vicinity, "lat": mlat, "lng": mlng})
+            return mosques
+        except Exception as e:
+            last_err = e
+            radius_m = max(int(radius_m * 0.8), 1000)
+            continue
+    logging.exception("Overpass fallback failed: %s", getattr(last_err, 'message', str(last_err)))
+    return []
+
 @app.get("/api/mosques/nearby")
 def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: float = Query(3.0, description="km cinsinden")):
     key = _google_api_key()
     if not key:
-        raise HTTPException(status_code=500, detail="Google API anahtarı tanımlı değil")
+        # Google anahtarı yoksa Overpass fallback
+        mosques = _overpass_mosques(lat, lng, radius)
+        return {"mosques": mosques}
     url = (
         "https://maps.googleapis.com/maps/api/place/nearbysearch/json?"
         f"location={lat},{lng}&radius={int(radius*1000)}&type=mosque&key={key}"
@@ -1438,7 +1478,11 @@ def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: flo
             mlat = loc.get('lat')
             mlng = loc.get('lng')
             mosques.append({"name": name, "vicinity": vicinity, "lat": mlat, "lng": mlng})
+        # Google sonuçları boşsa Overpass fallback dene
+        if not mosques:
+            mosques = _overpass_mosques(lat, lng, radius)
         return {"mosques": mosques}
     except Exception as e:
-        logging.exception("Yakın camiler API hatası")
-        raise HTTPException(status_code=500, detail="Yakın camiler alınamadı")
+        logging.exception("Yakın camiler API hatası, Overpass fallback deneniyor")
+        mosques = _overpass_mosques(lat, lng, radius)
+        return {"mosques": mosques}
