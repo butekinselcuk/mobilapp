@@ -190,8 +190,12 @@ async def on_startup():
 # CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # Geliştirme ve Expo Web için açıkça izin verilen origin'ler
+    allow_origins=[],
+    # localhost/127.0.0.1 ve tüm *.expo.dev alt alan adlarını kapsayan regex
+    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\\d+)?|https://.*\.expo\.dev)$",
+    # Kimlik bilgisi gerekmiyor (Bearer token header ile çalışıyoruz)
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
