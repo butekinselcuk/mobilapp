@@ -11,6 +11,9 @@ class User(Base):
     is_admin = Column(Boolean, default=False)  # Admin kullanıcı mı?
     is_premium = Column(Boolean, default=False)  # Premium kullanıcı mı?
     premium_expiry = Column(DateTime, nullable=True)  # Premium bitiş tarihi (opsiyonel)
+    # Profil özelleştirme alanları
+    theme_preference = Column(String, nullable=True)  # 'light' | 'dark'
+    avatar_url = Column(String, nullable=True)        # Yüklenen avatar dosyasının URL'si
     questions = relationship('Question', back_populates='user')
     question_history = relationship('UserQuestionHistory', back_populates='user', cascade='all, delete-orphan')
     favorite_hadiths = relationship('UserFavoriteHadith', back_populates='user', cascade='all, delete-orphan')

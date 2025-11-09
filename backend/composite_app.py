@@ -66,45 +66,163 @@ async def get_quran(
     ayah: Optional[int] = Query(None, description="Ayet numarası"),
     language: Optional[str] = Query("tr", description="Dil: tr/en/ar"),
     search: Optional[str] = Query(None, description="Metin arama"),
+    q: Optional[str] = Query(None, description="Metin arama (alias)"),
     reciter: Optional[str] = Query(None, description="Okuyucu adı")
 ):
+    """Kur'an ayetleri endpointi.
+    Not: main.py'deki /api/quran ile aynı şemayı döndürür ve benzer fallback uygular.
+    """
     async with AsyncSessionLocal() as session:
-        q = select(QuranVerse)
-        # Surah filtre
+        import re
+        from sqlalchemy import or_
+
+        query = select(QuranVerse)
+        # Sûre filtresi (isim veya numara)
         if surah:
             try:
                 surah_num = int(surah)
                 surah_name = SURAH_ID_TO_NAME.get(surah_num)
                 if surah_name:
-                    q = q.where(or_(QuranVerse.surah == surah_name, QuranVerse.surah == str(surah_num)))
+                    query = query.where(or_(QuranVerse.surah == surah_name, QuranVerse.surah == str(surah_num)))
                 else:
-                    q = q.where(or_(QuranVerse.surah == str(surah_num)))
+                    query = query.where(QuranVerse.surah == str(surah_num))
             except ValueError:
-                q = q.where(QuranVerse.surah == surah)
-        # Ayet filtre
+                query = query.where(QuranVerse.surah == surah)
+        # Ayet filtresi
         if ayah is not None:
-            q = q.where(QuranVerse.ayah == ayah)
-        # Dil filtre
+            query = query.where(QuranVerse.ayah == ayah)
+        # Dil filtresi
         if language:
-            q = q.where(QuranVerse.language == language)
-        # Metin arama
-        if search:
-            like = f"%{search}%"
-            q = q.where(or_(QuranVerse.text.ilike(like)))
-        res = await session.execute(q)
+            query = query.where(QuranVerse.language == language)
+        # Metin arama (search veya q)
+        search_term = search or q
+        if search_term:
+            like = f"%{search_term}%"
+            query = query.where(QuranVerse.text.ilike(like))
+
+        # Sorguyu çalıştır
+        res = await session.execute(query)
         verses = res.scalars().all()
-        # Audio desteği: reciter adı varsa audio_url üret
-        def build_audio(v):
+
+        # Audio URL üretimi: global ayet numarasına göre islamic.network CDN
+        def build_audio_url(v):
             if not reciter:
                 return None
-            return f"https://cdn.quran.audio/{reciter}/{v.surah}/{v.ayah}.mp3"
+            global_num = None
+            # DB'deki audio_url sonundan global numarayı yakalamayı dene
+            if getattr(v, 'audio_url', None):
+                m = re.search(r"/(\d+)\.mp3$", v.audio_url)
+                if m:
+                    try:
+                        global_num = int(m.group(1))
+                    except Exception:
+                        global_num = None
+            verse_num = global_num or getattr(v, 'ayah_number', None) or getattr(v, 'ayah', None)
+            if not verse_num:
+                return None
+            return f"https://cdn.islamic.network/quran/audio/128/{reciter}/{verse_num}.mp3"
+
+        # Eğer veri yoksa AlQuran Cloud fallback uygula
+        if not verses and (surah or search_term or ayah is not None):
+            try:
+                import httpx
+                # Surah ID'yi belirle
+                surah_id = None
+                if surah and str(surah).isdigit():
+                    surah_id = int(surah)
+                else:
+                    # İsimden ID'ye ters map
+                    for sid, sname in SURAH_ID_TO_NAME.items():
+                        if surah and str(surah).lower() == str(sname).lower():
+                            surah_id = sid
+                            break
+                if not surah_id:
+                    surah_id = 112  # İhlas
+
+                ayahs_ar = []
+                data_ar = {}
+                ayahs_tr_map = {}
+
+                async with httpx.AsyncClient(timeout=15) as client:
+                    # Arapça metin ve ses
+                    base_url_ar = f'https://api.alquran.cloud/v1/surah/{surah_id}/ar.alafasy'
+                    try:
+                        r_ar = await client.get(base_url_ar)
+                        if r_ar.status_code == 200:
+                            data_ar = r_ar.json().get('data', {})
+                            ayahs_ar = data_ar.get('ayahs', []) or []
+                        else:
+                            ayahs_ar = []
+                    except Exception:
+                        ayahs_ar = []
+
+                    # Türkçe meal istenirse ekle
+                    if (language or '').lower().startswith('tr'):
+                        base_url_tr = f'https://api.alquran.cloud/v1/surah/{surah_id}/tr.yildirim'
+                        try:
+                            r_tr = await client.get(base_url_tr)
+                            if r_tr.status_code == 200:
+                                data_tr = r_tr.json().get('data', {})
+                                for a in data_tr.get('ayahs', []) or []:
+                                    try:
+                                        ayahs_tr_map[int(a.get('numberInSurah', 0))] = a.get('text')
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                fallback = []
+                surah_name_from_api = data_ar.get('englishName') or data_ar.get('name')
+                for a in ayahs_ar:
+                    try:
+                        num_in_surah = int(a.get('numberInSurah', 0))
+                    except Exception:
+                        num_in_surah = a.get('numberInSurah') or a.get('ayah_number') or a.get('ayah') or None
+                    text_ar = a.get('text')
+                    audio_url = a.get('audio')
+                    tr_text = ayahs_tr_map.get(num_in_surah)
+                    item = {
+                        'id': None,
+                        'surah': surah_name_from_api,
+                        'ayah': num_in_surah,
+                        'text': text_ar,
+                        'translation': tr_text,
+                        'language': (language or 'tr'),
+                        'surah_id': surah_id,
+                        'surah_name': surah_name_from_api,
+                        'ayah_number': num_in_surah,
+                        'text_ar': text_ar,
+                        'text_tr': tr_text,
+                        'audio_url': audio_url,
+                    }
+                    # Reciter verilmişse global numarayı kullanarak URL üret
+                    if reciter and a.get('number'):
+                        try:
+                            global_num = int(a.get('number'))
+                            item['audio_url'] = f'https://cdn.islamic.network/quran/audio/128/{reciter}/{global_num}.mp3'
+                        except Exception:
+                            pass
+                    fallback.append(item)
+
+                return fallback
+            except Exception:
+                return []
+
+        # Normal yanıt (ana şemaya hizalı)
         return [
             {
-                "surah": v.surah,
-                "ayah": v.ayah,
-                "text": v.text,
-                "language": v.language,
-                "audio_url": build_audio(v)
+                'id': v.id,
+                'surah': v.surah,
+                'ayah': v.ayah,
+                'text': v.text,
+                'translation': v.translation,
+                'language': v.language,
+                'surah_id': getattr(v, 'surah_id', None),
+                'surah_name': getattr(v, 'surah_name', v.surah),
+                'ayah_number': getattr(v, 'ayah_number', v.ayah),
+                'text_ar': getattr(v, 'text_ar', None),
+                'text_tr': getattr(v, 'text_tr', None),
+                'audio_url': build_audio_url(v) if reciter else (getattr(v, 'audio_url', None))
             }
             for v in verses
         ]

@@ -740,6 +740,337 @@ async def update_setting(req: SettingUpdateRequest, current_user: User = Depends
             session.add(setting)
         await session.commit()
         return {"status": "ok"}
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, current_user.id)
+        if req.username:
+            user.username = req.username
+        if req.email:
+            user.email = req.email
+        await session.commit()
+        return {"status": "updated", "username": user.username, "email": user.email}
+
+@app.post("/user/change_password")
+async def change_password(req: ChangePasswordRequest, current_user: User = Depends(get_current_user)):
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, current_user.id)
+        from auth import verify_password, get_password_hash
+        if not verify_password(req.old_password, user.hashed_password):
+            raise HTTPException(status_code=400, detail="Mevcut şifre yanlış.")
+        # Şifre karmaşıklık doğrulaması
+        npw = req.new_password or ""
+        if not (
+            len(npw) >= 8 and
+            re.search(r"[A-Z]", npw) and
+            re.search(r"[a-z]", npw) and
+            re.search(r"\d", npw) and
+            re.search(r"[^A-Za-z0-9]", npw)
+        ):
+            raise HTTPException(status_code=400, detail="Yeni şifre karmaşıklık kurallarını sağlamıyor.")
+        user.hashed_password = get_password_hash(req.new_password)
+        await session.commit()
+        return {"status": "password_changed"}
+
+@app.post("/user/theme")
+async def update_theme(req: ThemeUpdateRequest, current_user: User = Depends(get_current_user)):
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, current_user.id)
+        user.theme_preference = req.theme
+        await session.commit()
+        return {"status": "updated", "theme_preference": user.theme_preference}
+
+@app.post("/user/avatar")
+async def upload_avatar(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+    # İçerik türü ve boyut doğrulama
+    if file.content_type not in ("image/jpeg", "image/png"):
+        raise HTTPException(status_code=400, detail="Sadece JPEG/PNG desteklenir.")
+    data = await file.read()
+    max_bytes = 2 * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail="Dosya boyutu 2MB limitini aşıyor.")
+
+    # Dosya adı ve uzantı belirleme
+    ext = "jpg" if file.content_type == "image/jpeg" else "png"
+    fname = f"{uuid.uuid4().hex}.{ext}"
+    fpath = os.path.join(_avatars_dir, fname)
+
+    # 500x500 center-crop ve kaydetme (Pillow varsa)
+    try:
+        if PIL_AVAILABLE:
+            from io import BytesIO
+            buf = BytesIO(data)
+            img = Image.open(buf)
+            img = img.convert("RGB")
+            w, h = img.size
+            # Kare kırpma (merkez)
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+            img = img.resize((500, 500))
+            img.save(fpath, format="JPEG", quality=90)
+        else:
+            # Pillow yoksa raw veriyi doğrudan yaz (boyut doğrulaması zaten yapıldı)
+            with open(fpath, "wb") as f:
+                f.write(data)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Avatar işleme sırasında hata oluştu.")
+
+    url = f"/static/avatars/{fname}"
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, current_user.id)
+        user.avatar_url = url
+        await session.commit()
+        return {"status": "uploaded", "avatar_url": url}
+
+@app.delete("/user/delete")
+async def delete_account(current_user: User = Depends(get_current_user)):
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, current_user.id)
+        await session.delete(user)
+        await session.commit()
+        return {"status": "deleted"} 
+
+@app.post("/admin/upload_hadiths")
+async def upload_hadiths(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+    import json
+    import sys
+    import traceback
+    import csv
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    content_bytes = await file.read()
+    name = (file.filename or '').lower()
+    content_type = getattr(file, 'content_type', '') or ''
+
+    # JSON dosyasıysa esnek bir şekilde parse et
+    if name.endswith('.json') or 'json' in content_type:
+        try:
+            text = content_bytes.decode('utf-8', errors='ignore')
+            data = json.loads(text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON okunamadı: {e}")
+
+        # Liste ya da {'items': [...]} formatlarını destekle
+        if isinstance(data, dict) and isinstance(data.get('items'), list):
+            items = data['items']
+        elif isinstance(data, list):
+            items = data
+        else:
+            raise HTTPException(status_code=400, detail="Geçersiz JSON formatı. Liste veya 'items' alanı bekleniyor.")
+
+        skipped = []
+        eklenen = 0
+        async with AsyncSessionLocal() as session:
+            for idx, item in enumerate(items, 1):
+                try:
+                    turkish_text = item.get('turkish_text') or item.get('text_tr') or item.get('text') or item.get('tr_text')
+                    source = item.get('source') or item.get('book_name') or item.get('kitap') or item.get('collection')
+                    if not turkish_text or not source:
+                        print(f"ATLANIYOR (satır {idx}): Eksik zorunlu alan! turkish_text={turkish_text}, source={source}")
+                        skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
+                        continue
+
+                    # Opsiyonel alanları esnek eşle
+                    reference = item.get('reference')
+                    # Bazı datasetlerde numaraları birleştirelim
+                    if not reference:
+                        parts = []
+                        for key in ['hadith_number', 'hadis_no', 'bab']:
+                            val = item.get(key)
+                            if val:
+                                parts.append(str(val))
+                        reference = ', '.join(parts) if parts else None
+                    category = item.get('category') or item.get('kategori')
+                    language = item.get('language') or 'tr'
+
+                    hadith = Hadith(
+                        arabic_text=item.get('arabic_text') or item.get('text_ar') or None,
+                        turkish_text=turkish_text,
+                        source=source,
+                        reference=reference,
+                        category=category,
+                        language=language,
+                    )
+                    session.add(hadith)
+                    eklenen += 1
+                except Exception as e:
+                    print(f"ATLANIYOR (satır {idx}): HATA: {e}\n{traceback.format_exc()}")
+                    skipped.append({"row": idx, "reason": str(e)})
+            await session.commit()
+        print(f'JSON yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {len(skipped)}')
+        return {"status": "ok", "added": eklenen, "skipped": len(skipped), "skipped_details": skipped}
+
+    # Aksi halde CSV olarak devam et
+    decoded_lines = content_bytes.decode('utf-8', errors='ignore').splitlines()
+    reader = csv.DictReader(decoded_lines)
+    new_hadiths = []
+    skipped = []
+    eklenen = 0
+    atlanan = 0
+    async with AsyncSessionLocal() as session:
+        for idx, row in enumerate(reader, 1):
+            try:
+                turkish_text = row.get('turkish_text') or row.get('text')
+                if not turkish_text or not row.get('source'):
+                    print(f"ATLANIYOR (satır {idx}): Eksik zorunlu alan! hadis_id={row.get('hadis_id')}, turkish_text={turkish_text}, source={row.get('source')}")
+                    skipped.append({"row": idx, "reason": "Eksik zorunlu alan (turkish_text/text veya source)"})
+                    atlanan += 1
+                    continue
+                from datetime import datetime
+                def force_json_str(val):
+                    import json
+                    if val is None or val == '' or val == []:
+                        return ''
+                    if isinstance(val, str):
+                        try:
+                            loaded = json.loads(val)
+                            if isinstance(loaded, list):
+                                return val
+                            else:
+                                return json.dumps([val], ensure_ascii=False)
+                        except Exception:
+                            return json.dumps([val], ensure_ascii=False)
+                    if isinstance(val, list):
+                        return json.dumps(val, ensure_ascii=False)
+                    return json.dumps([val], ensure_ascii=False)
+                # created_at alanını date nesnesine çevir
+                created_at_val = row.get('created_at')
+                created_at = None
+                if created_at_val:
+                    try:
+                        created_at = datetime.strptime(created_at_val, '%Y-%m-%d').date()
+                    except Exception:
+                        created_at = None
+                hadith = Hadith(
+                    hadis_id=row.get('hadis_id'),
+                    kitap=row.get('kitap'),
+                    bab=row.get('bab'),
+                    hadis_no=row.get('hadis_no'),
+                    arabic_text=row.get('arabic_text'),
+                    turkish_text=turkish_text,
+                    tags=force_json_str(row.get('tags')),
+                    topic=row.get('topic'),
+                    authenticity=row.get('authenticity'),
+                    narrator_chain=force_json_str(row.get('narrator_chain')),
+                    related_ayah=force_json_str(row.get('related_ayah')),
+                    context=row.get('context'),
+                    source=row.get('source'),
+                    reference=row.get('reference'),
+                    category=row.get('category'),
+                    language=row.get('language'),
+                    embedding=row.get('embedding'),
+                    created_at=created_at,
+                )
+                session.add(hadith)
+                new_hadiths.append(hadith)
+                print(f"EKLENİYOR (satır {idx}): hadis_id={row.get('hadis_id')}, turkish_text={str(turkish_text)[:30]}")
+                eklenen += 1
+            except Exception as e:
+                print(f"ATLANIYOR (satır {idx}): HATA: {e}\n{traceback.format_exc()}")
+                skipped.append({"row": idx, "reason": str(e)})
+                atlanan += 1
+        await session.commit()
+    print(f'CSV yükleme tamamlandı. Eklenen: {eklenen}, Atlanan: {atlanan}')
+    return {"status": "ok", "added": len(new_hadiths), "skipped": len(skipped), "skipped_details": skipped}
+
+@app.post("/admin/update_embeddings")
+async def update_embeddings(current_user: User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    from embedding_utils import update_hadith_embeddings
+    try:
+        updated_count = await update_hadith_embeddings()
+        logging.info(f"Embedding güncelleme tamamlandı: {updated_count} kayıt güncellendi")
+        return {"status": "ok", "updated_count": updated_count}
+    except Exception as e:
+        logging.exception("Admin embedding güncelleme HATASI")
+        raise HTTPException(status_code=500, detail="Embedding güncelleme hatası")
+
+@app.get("/admin/embedding_status")
+async def embedding_status(current_user: User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    from sqlalchemy import func
+    async with AsyncSessionLocal() as session:
+        total = (await session.execute(select(func.count(Hadith.id)))).scalar_one()
+        with_emb = (await session.execute(select(func.count(Hadith.id)).where(Hadith.embedding.isnot(None)))).scalar_one()
+        without_emb = total - with_emb
+        return {
+            "total_hadiths": total,
+            "with_embedding": with_emb,
+            "without_embedding": without_emb,
+        }
+
+@app.post("/admin/import_tr_json")
+async def admin_import_tr_json(current_user: User = Depends(get_current_user)):
+    """hadiths_tr.json dosyasını veritabanına import eder."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
+        from import_hadiths import import_hadiths
+        inserted = await import_hadiths(tr_path)
+        return {"status": "ok", "inserted": inserted}
+    except Exception as e:
+        logging.exception("Admin TR JSON import HATASI")
+        raise HTTPException(status_code=500, detail="TR JSON import hatası")
+
+@app.post("/admin/import_ar_json")
+async def admin_import_ar_json(current_user: User = Depends(get_current_user)):
+    """hadiths_ar.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
+        if not os.path.exists(ar_path):
+            raise HTTPException(status_code=404, detail="AR JSON bulunamadı")
+        from import_hadiths import _merge_language_json
+        count = await _merge_language_json(ar_path, lang='ar')
+        return {"status": "ok", "processed": count}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("Admin AR JSON import HATASI")
+        raise HTTPException(status_code=500, detail="AR JSON import hatası")
+
+@app.post("/admin/import_en_json")
+async def admin_import_en_json(current_user: User = Depends(get_current_user)):
+    """hadiths_en.json dosyasını mevcut kayıtlarla birleştirir veya ekler."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        en_path = os.path.join(backend_dir, "hadiths_en.json")
+        if not os.path.exists(en_path):
+            raise HTTPException(status_code=404, detail="EN JSON bulunamadı")
+        from import_hadiths import _merge_language_json
+        count = await _merge_language_json(en_path, lang='en')
+        return {"status": "ok", "processed": count}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("Admin EN JSON import HATASI")
+        raise HTTPException(status_code=500, detail="EN JSON import hatası")
+
+@app.post("/admin/import_all_json")
+async def admin_import_all_json(current_user: User = Depends(get_current_user)):
+    """TR + AR + EN JSON’ları sırayla içeri alır ve birleştirir."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+    try:
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        tr_path = os.path.join(backend_dir, "hadiths_tr.json")
+        ar_path = os.path.join(backend_dir, "hadiths_ar.json")
+        en_path = os.path.join(backend_dir, "hadiths_en.json")
+        from import_hadiths import import_hadiths_all
+        processed = await import_hadiths_all(tr_path, ar_path=ar_path, en_path=en_path)
+        return {"status": "ok", "processed": processed}
+    except Exception:
+        logging.exception("Admin ALL JSON import HATASI")
+        raise HTTPException(status_code=500, detail="ALL JSON import hatası")
+>>>>>>> 0368172 (feat(backend): /api/quran fallback ve audio_url eşlemesini düzelt; açık uçlar için şema güncellemesi)
 
 @app.get("/admin/users")
 async def list_users(current_user: User = Depends(get_current_user)):
