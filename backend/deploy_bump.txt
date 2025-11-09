@@ -1,0 +1,2 @@
+Deploy bump: ensure latest backend with /api/prayer_times and /api/mosques/nearby is active.
+Timestamp: 2025-11-09T06:27:50Z
