@@ -30,6 +30,7 @@ import csv
 from models import JourneyModule, JourneyStep, UserJourneyProgress
 from fastapi import Body
 from models import QuranVerse, Dua, Zikr, Tafsir, QuranAudio
+from models import Mosque
 import json
 import httpx
 from textwrap import shorten
@@ -50,16 +51,12 @@ except ImportError as e:
 load_dotenv()
 print('DEBUG: SECRET_KEY =', os.getenv('SECRET_KEY'))
 
-# Swagger/OpenAPI URL'lerini üretimde garantiye almak için açıkça tanımla
 app = FastAPI(
-    docs_url="/docs",
-    redoc_url=None,
-    openapi_url="/openapi.json",
     swagger_ui_parameters={
         "persistAuthorization": True,
         "displayRequestDuration": True,
-        "defaultModelsExpandDepth": 1,
-    },
+        "defaultModelsExpandDepth": -1,
+    }
 )
 
 # Sağlık kontrolü: her zaman 200 döndür, DB durumunu bilgi olarak ekle
@@ -294,7 +291,14 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             h_ref = (h.get('reference') or '')
             if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
                 filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
-        filtered_sources.append(SourceItem(type="ai", name="AI Asistan"))
+        # AI suffix: model türüne göre etiketle
+        _rt = (response_type or '').lower()
+        _suffix = ' -AI'
+        if 'claude' in _rt:
+            _suffix = ' -AI CL'
+        elif 'gemini' in _rt:
+            _suffix = ' -AI GMN'
+        filtered_sources.append(SourceItem(type="ai", name=f"AI Asistan{_suffix}"))
         sources = filtered_sources if filtered_sources else sources
     else:
         sources = []
@@ -353,7 +357,7 @@ async def create_or_get_session(request: SessionRequest, current_user: User = De
             print("[RT-SEQ-FIX] chat_sessions.id sequence kontrol/onarım atlandı")
         if request.session_token:
             # Mevcut session'ı bul
-            result = await session.execute(
+            result = await session execute(
                 select(ChatSession).options(selectinload(ChatSession.messages))
                 .where(ChatSession.session_token == request.session_token)
             )
@@ -408,81 +412,36 @@ async def get_session_messages(session_token: str, current_user: User = Depends(
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_with_session(request: ChatRequest, current_user: User = Depends(get_current_user_optional)):
-    async with AsyncSessionLocal() as session:
-        # Çok kısa veya tek kelime sorular için reddetme
-        if len(request.question.strip().split()) < 2:
-            return ChatResponse(answer="Sorunuzu daha açık yazar mısınız?", sources=[], session_token=request.session_token or "")
-        # Mevcut session'ı bul veya oluştur
-        if request.session_token:
-            result = await session.execute(select(ChatSession).where(ChatSession.session_token == request.session_token))
-            chat_session = result.scalar_one_or_none()
-            if not chat_session:
-                chat_session = ChatSession(
-                    user_id=current_user.id if current_user else None,
-                    session_token=request.session_token
-                )
-                session.add(chat_session)
-                await session.commit()
+    # Session token yoksa yeni oluştur
+    if not request.session_token:
+        request.session_token = str(uuid.uuid4())
+    
+    # Mevcut ask_ai fonksiyonunu kullan
+    ask_request = AskRequest(question=request.question, source_filter=request.source_filter)
+    
+    # Kullanıcı varsa normal ask_ai'yi çağır, yoksa session tabanlı işlem yap
+    if current_user:
+        response = await ask_ai(ask_request, current_user)
+    else:
+        # Anonim kullanıcı için Ultimate RAG + akıllı fallback
+        # Tek kelime veya çok kısa sorularda yönlendir
+        if len([w for w in request.question.strip().split() if w]) < 2:
+            answer = "Sorunuzu daha açık yazar mısınız?"
+            sources = []
+            response = AskResponse(answer=answer, sources=sources)
         else:
-            chat_session = ChatSession(
-                user_id=current_user.id if current_user else None,
-                session_token=str(uuid.uuid4())
+            hadith_dicts = await search_hadiths_ultimate(request.question, top_k=3)
+            answer, used_fallback, response_type = generate_ai_response_with_fallback(
+                request.question,
+                hadith_dicts,
+                True
             )
-            session.add(chat_session)
-            await session.commit()
-        # Kullanıcı mesajını kaydet
-        user_msg = ChatMessage(
-            session_id=chat_session.id,
-            message_type="user",
-            content=request.question,
-            sources=None
-        )
-        session.add(user_msg)
-        await session.commit()
-        # AI cevabını üret
-        hadith_dicts = await search_hadiths_ultimate(request.question, top_k=3)
-        answer, used_fallback, response_type = generate_ai_response_with_fallback(
-            request.question,
-            hadith_dicts,
-            True
-        )
-        # AI mesajını kaydet
-        ai_sources = [
-            SourceItem(type="hadis", name=(h.get('full_reference') or (h.get('source','') + ' - ' + h.get('reference',''))))
-            for h in (hadith_dicts or [])
-        ]
-        ai_msg = ChatMessage(
-            session_id=chat_session.id,
-            message_type="ai",
-            content=answer,
-            sources=json.dumps([s.dict() for s in ai_sources]) if ai_sources else None
-        )
-        session.add(ai_msg)
-        await session.commit()
-        return ChatResponse(answer=answer, sources=ai_sources, session_token=chat_session.session_token)
-
-# --- Yardımcı fonksiyonlar ---
-async def get_setting(key: str, default: Optional[str] = None) -> str:
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Setting).where(Setting.key == key))
-        setting = result.scalar_one_or_none()
-        return setting.value if setting and setting.value is not None else (default or "")
-
-async def _ensure_sequence(session: AsyncSession, table_name: str, column_name: str):
-    try:
-        res_seq = await session.execute(text("SELECT pg_get_serial_sequence(:tbl, :col)").bindparams(tbl=table_name, col=column_name))
-        seq_name = res_seq.scalar()
-        if not seq_name:
-            fallback_seq = f"{table_name}_{column_name}_seq"
-            await session.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {fallback_seq}"))
-            await session.execute(text(f"ALTER SEQUENCE {fallback_seq} OWNED BY {table_name}.{column_name}"))
-            await session.execute(text(f"ALTER TABLE {table_name} ALTER COLUMN {column_name} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
-            seq_name = fallback_seq
-        max_res = await session.execute(text(f"SELECT COALESCE(MAX({column_name}), 0) FROM {table_name}"))
-        max_id = max_res.scalar() or 0
-        await session.execute(text("SELECT setval(:seq::regclass, :newval, TRUE)").bindparams(seq=seq_name, newval=max_id))
-    except Exception:
-        pass
-
-# --- İslamî içerik ve yönetim endpoint'leri (kısaltıldı) ---
-# ... burada kalan uzun endpoint tanımlarınız olduğu gibi devam ediyor ...
+            # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
+            if not hadith_dicts:
+                answer = await get_setting(
+                    'ai_no_hadith_message',
+                    'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
+                )
+            # Kaynakları hazırla (UI için sade gösterim)
+            sources = []
+            for h in hadith_dicts:
