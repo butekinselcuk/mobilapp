@@ -204,10 +204,7 @@ app.add_middleware(
     allow_headers=["*"],         # ⬅️ DEĞİŞİKLİK: Daha esnek hale getirildi.
 )
 
-# Global preflight handler: tüm OPTIONS isteklerine 200 OK
-@app.options("/{rest_of_path:path}")
-async def preflight_handler():
-    return {}
+
 
 app.include_router(auth_router, prefix="/auth")
 
