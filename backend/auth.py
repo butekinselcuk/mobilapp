@@ -112,17 +112,19 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     return {"msg": "Kayıt başarılı."}
 
 
+# auth.py - Satır 106 civarı
+
 @router.post('/login')
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalar_one_or_none()
 
-    # Kullanıcı bulunamadı ise 401 döndür (CORS garantili)
+    # Kullanıcı bulunamadı ise 401 döndür
     if not user:
         return JSONResponse(
             status_code=401,
-            content={"detail": "Kullanıcı adı veya şifre hatalı."},
-            headers={"Access-Control-Allow-Origin": "*"}
+            content={"detail": "Kullanıcı adı veya şifre hatalı."}
+            # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
         )
 
     # Hash doğrulamada yaşanabilecek UnknownHashError vb. durumları güvenli şekilde ele al
@@ -134,8 +136,8 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not is_valid:
         return JSONResponse(
             status_code=401,
-            content={"detail": "Kullanıcı adı veya şifre hatalı."},
-            headers={"Access-Control-Allow-Origin": "*"}
+            content={"detail": "Kullanıcı adı veya şifre hatalı."}
+            # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
         )
 
     access_token = create_access_token(data={"sub": user.username})
@@ -146,8 +148,8 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
             "access_token": access_token,
             "token_type": "bearer",
             "user_id": user.id
-        },
-        headers={"Access-Control-Allow-Origin": "*"}
+        }
+        # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
     )
 
 
