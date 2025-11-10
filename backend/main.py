@@ -199,9 +199,9 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=False,   # Bearer Token olduğundan False kalmalı
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=True,      # ⬅️ DEĞİŞİKLİK: 'False' idi, 'True' olmalı.
+    allow_methods=["*"],         # ⬅️ DEĞİŞİKLİK: Daha esnek hale getirildi.
+    allow_headers=["*"],         # ⬅️ DEĞİŞİKLİK: Daha esnek hale getirildi.
 )
 
 # Global preflight handler: tüm OPTIONS isteklerine 200 OK
