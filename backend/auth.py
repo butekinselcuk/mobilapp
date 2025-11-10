@@ -89,7 +89,9 @@ async def get_current_user_optional(token: str = Depends(oauth2_scheme_optional)
         raise credentials_exception
     return user
 
+# POST /register ve /register/ (slash alias) -> redirect olmadan çalışsın
 @router.post('/register')
+@router.post('/register/')
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where((User.username == req.username) | (User.email == req.email)))
     user = result.scalar_one_or_none()
