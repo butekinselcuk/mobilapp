@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -116,16 +117,38 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Kullanıcı adı veya şifre hatalı.")
+    # Kullanıcı bulunamadı ise 401 döndür (CORS garantili)
+    if not user:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Kullanıcı adı veya şifre hatalı."},
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
+    # Hash doğrulamada yaşanabilecek UnknownHashError vb. durumları güvenli şekilde ele al
+    try:
+        is_valid = verify_password(req.password, user.hashed_password)
+    except Exception:
+        is_valid = False
+
+    if not is_valid:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Kullanıcı adı veya şifre hatalı."},
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
     access_token = create_access_token(data={"sub": user.username})
 
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user_id": user.id
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user_id": user.id
+        },
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 
 @router.get('/me')
