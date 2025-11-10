@@ -114,34 +114,45 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 # auth.py - Satır 106 civarı
 
+# auth.py - Satır 106 civarı
+
 @router.post('/login')
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    
+    print("--- LOGIN FONKSİYONU BAŞLADI ---")
+    print(f"Kullanıcı aranıyor: {req.username}")
+    
     result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalar_one_or_none()
 
-    # Kullanıcı bulunamadı ise 401 döndür
     if not user:
+        print("Kullanıcı bulunamadı, 401 döndürülüyor.")
         return JSONResponse(
             status_code=401,
             content={"detail": "Kullanıcı adı veya şifre hatalı."}
-            # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
         )
+    
+    print(f"Kullanıcı bulundu: {user.username}")
+    print("Şifre doğrulaması başlıyor...")
 
-    # Hash doğrulamada yaşanabilecek UnknownHashError vb. durumları güvenli şekilde ele al
     try:
         is_valid = verify_password(req.password, user.hashed_password)
-    except Exception:
+        print("Şifre doğrulama bitti.")
+    except Exception as e:
+        print(f"!!! HATA: Şifre doğrulama (verify_password) çöktü: {e}")
         is_valid = False
 
     if not is_valid:
+        print("Şifre geçersiz, 401 döndürülüyor.")
         return JSONResponse(
             status_code=401,
             content={"detail": "Kullanıcı adı veya şifre hatalı."}
-            # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
         )
 
+    print("Giriş başarılı, token oluşturuluyor.")
     access_token = create_access_token(data={"sub": user.username})
 
+    print("--- LOGIN BAŞARIYLA TAMAMLANDI ---")
     return JSONResponse(
         status_code=200,
         content={
@@ -149,7 +160,6 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
             "token_type": "bearer",
             "user_id": user.id
         }
-        # ⬅️ DEĞİŞİKLİK: 'headers' parametresi buradan kaldırıldı.
     )
 
 
