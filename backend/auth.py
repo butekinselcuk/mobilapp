@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 print('DEBUG: AUTH.PY SECRET_KEY =', os.getenv('SECRET_KEY'))
 from pydantic import BaseModel
+from fastapi import Response
 
 SECRET_KEY = os.getenv('SECRET_KEY', 'devsecret')
 ALGORITHM = 'HS256'
@@ -101,6 +102,33 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.refresh(new_user)
     return {"msg": "Kayıt başarılı."}
 
+# CORS preflight için tutarlı OPTIONS yanıtı (Register)
+@router.options('/register')
+async def register_options():
+    return Response(
+        content="OK",
+        media_type="text/plain",
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'content-type, authorization',
+            'Access-Control-Max-Age': '600',
+        }
+    )
+
+@router.options('/register/')
+async def register_slash_options():
+    return Response(
+        content="OK",
+        media_type="text/plain",
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'content-type, authorization',
+            'Access-Control-Max-Age': '600',
+        }
+    )
+
 @router.post('/login')
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.username == req.username))
@@ -118,4 +146,4 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
         "is_admin": current_user.is_admin,
         "is_premium": current_user.is_premium,
         "premium_expiry": current_user.premium_expiry.isoformat() if current_user.premium_expiry else None
-    } 
+    }
