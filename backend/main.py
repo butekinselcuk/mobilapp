@@ -189,19 +189,19 @@ async def on_startup():
 
 # CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
 origins = [
-    "http://localhost:8091",
-    "http://localhost:3000",
-    "http://127.0.0.1:8091",
-    "https://islami-app-expo.vercel.app",
+    "http://localhost:8091",      
+    "http://localhost:3000",      
+    "http://127.0.0.1:8091",      
+    "https://islami-app-backend.onrender.com", 
+    # "https://your-frontend-domain.com",  # varsa ekle
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=None,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,   # Bearer Token olduğundan False kalmalı
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(auth_router, prefix="/auth")
