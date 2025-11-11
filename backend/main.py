@@ -1831,16 +1831,15 @@ async def get_zikr(category: str = None, language: str = 'tr', q: str = None):
         if language:
             query = query.where(Zikr.language == language)
         if q:
-            query = query.where(Zikr.text.ilike(f'%{q}%'))
+            like = f'%{q}%'
+            query = query.where(or_(Zikr.name.ilike(like), Zikr.slug.ilike(like)))
         result = await session.execute(query)
         zikrs = result.scalars().all()
         return [
             {
                 'id': z.id,
-                'title': z.title,
-                'text': z.text,
-                'translation': z.translation,
-                'count': z.count,
+                'title': z.name,
+                'count': z.default_target,
                 'category': z.category,
                 'language': z.language
             } for z in zikrs
@@ -1889,8 +1888,8 @@ async def start_zikirmatik(req: ZikrStartRequest, current_user: User = Depends(g
             zikr = result.scalar_one_or_none()
             if not zikr:
                 raise HTTPException(status_code=404, detail='Zikr bulunamadı')
-            title = title or zikr.title
-            target_count = target_count or zikr.count
+            title = title or zikr.name
+            target_count = target_count or (zikr.default_target or 33)
         s = ZikrSession(user_id=user_id, zikr_id=zikr_id, title=title, target_count=target_count, current_count=0, status='active')
         session.add(s)
         await session.commit()
