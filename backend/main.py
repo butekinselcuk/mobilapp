@@ -1902,12 +1902,28 @@ async def start_zikirmatik(req: ZikrStartRequest, current_user: User = Depends(g
             if not zikr:
                 raise HTTPException(status_code=404, detail='Zikr bulunamadı')
             title = title or zikr.name
-            target_count = target_count or (zikr.default_target or 33)
+            # hedef sayıyı sağlamlaştır
+            try:
+                target_count = int(target_count or (zikr.default_target or 33))
+            except Exception:
+                target_count = 33
+        else:
+            # serbest oturum: başlık ve hedef default
+            title = title or 'Zikir'
+            try:
+                target_count = int(target_count or 33)
+            except Exception:
+                target_count = 33
         s = ZikrSession(user_id=user_id, zikr_id=zikr_id, title=title, target_count=target_count, current_count=0, status='active')
-        session.add(s)
-        await session.commit()
-        await session.refresh(s)
-        return _serialize_zikr_session(s)
+        try:
+            session.add(s)
+            await session.commit()
+            await session.refresh(s)
+            return _serialize_zikr_session(s)
+        except Exception as e:
+            await session.rollback()
+            print(f"[ERROR][ZIKR_START] user_id={user_id}, zikr_id={zikr_id}, title={title}, target={target_count}: {e}")
+            raise HTTPException(status_code=500, detail=f"Zikirmatik oturumu başlatılamadı: {str(e)}")
 
 @app.get('/api/zikirmatik/active')
 async def get_active_zikirmatik(current_user: User = Depends(get_current_user_optional)):
@@ -1936,9 +1952,14 @@ async def increment_zikirmatik(session_id: int, req: ZikrIncrementRequest, curre
         except Exception:
             amount = 1
         s.current_count = (s.current_count or 0) + max(1, amount)
-        await session.commit()
-        await session.refresh(s)
-        return _serialize_zikr_session(s)
+        try:
+            await session.commit()
+            await session.refresh(s)
+            return _serialize_zikr_session(s)
+        except Exception as e:
+            await session.rollback()
+            print(f"[ERROR][ZIKR_INCREMENT] session_id={session_id}, amount={amount}: {e}")
+            raise HTTPException(status_code=500, detail=f"Sayaç güncellenemedi: {str(e)}")
 
 @app.post('/api/zikirmatik/{session_id}/finish')
 async def finish_zikirmatik(session_id: int, current_user: User = Depends(get_current_user_optional)):
@@ -1949,9 +1970,14 @@ async def finish_zikirmatik(session_id: int, current_user: User = Depends(get_cu
             raise HTTPException(status_code=404, detail='Oturum bulunamadı')
         s.status = 'finished'
         s.finished_at = datetime.utcnow()
-        await session.commit()
-        await session.refresh(s)
-        return _serialize_zikr_session(s)
+        try:
+            await session.commit()
+            await session.refresh(s)
+            return _serialize_zikr_session(s)
+        except Exception as e:
+            await session.rollback()
+            print(f"[ERROR][ZIKR_FINISH] session_id={session_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Oturum bitirilemedi: {str(e)}")
 
 @app.get('/api/zikirmatik/stats')
 async def zikirmatik_stats(period: str = 'today', current_user: User = Depends(get_current_user_optional)):
