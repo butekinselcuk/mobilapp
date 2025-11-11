@@ -105,6 +105,19 @@ async def on_startup():
     # Startup’ta DB’e bağlanma hatalarını yutarak uygulamayı ayakta tut
     try:
         await create_tables()
+        # Zikr oturum tablosu gerçekten mevcut mu kontrol et; yoksa create_all tekrar çağır
+        try:
+            async with engine.begin() as conn:
+                check_res = await conn.execute(text("SELECT to_regclass('public.zikr_sessions')"))
+                exists = check_res.scalar()
+                if not exists:
+                    print("[BOOT] 'zikr_sessions' tablosu yok. create_all tekrar çağrılıyor.")
+                    await conn.run_sync(Base.metadata.create_all)
+                else:
+                    print("[BOOT] 'zikr_sessions' tablosu mevcut.")
+        except Exception:
+            # Bu kontrol başarısız olursa uygulama yine de çalışsın
+            print("[BOOT] 'zikr_sessions' tablo kontrolü başarısız; uygulama devam ediyor.")
         # Sequence onarımı: tabloların id sequence değerlerini MAX(id) ile senkronize et
         try:
             async with engine.begin() as conn:
