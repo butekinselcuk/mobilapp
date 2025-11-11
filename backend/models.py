@@ -175,6 +175,21 @@ class Zikr(Base):
     source = relationship('Source')
     language = Column(String, default='tr')
 
+class ZikrSession(Base):
+    __tablename__ = 'zikr_sessions'
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
+    zikr_id = Column(Integer, ForeignKey('zikrs.id'), nullable=True)
+    title = Column(String, nullable=True)
+    target_count = Column(Integer, nullable=True)
+    current_count = Column(Integer, default=0)
+    status = Column(String, default='active')  # 'active' | 'finished'
+    created_at = Column(DateTime, server_default=func.now())
+    finished_at = Column(DateTime, nullable=True)
+    # İlişkiler
+    user = relationship('User')
+    zikr = relationship('Zikr')
+
 class Tafsir(Base):
     __tablename__ = 'tafsirs'
     id = Column(Integer, primary_key=True, index=True)
