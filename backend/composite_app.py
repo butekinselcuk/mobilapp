@@ -144,10 +144,11 @@ async def get_zikr(
             q = q.where(Zikr.language == language)
         if search:
             like = f"%{search}%"
-            q = q.where(or_(Zikr.text.ilike(like)))
+            q = q.where(or_(Zikr.name.ilike(like), Zikr.slug.ilike(like)))
         res = await session.execute(q)
         items = res.scalars().all()
-        return [{"id": z.id, "text": z.text, "category": z.category, "language": z.language} for z in items]
+        # Frontend beklenen yapıya uyum: title=name, count=default_target
+        return [{"id": z.id, "title": z.name, "count": z.default_target, "category": z.category, "language": z.language} for z in items]
 
 # --- Tefsir ---
 @app.get("/api/tafsir")
