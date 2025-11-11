@@ -29,7 +29,7 @@ from fastapi import UploadFile, File
 import csv
 from models import JourneyModule, JourneyStep, UserJourneyProgress
 from fastapi import Body
-from models import QuranVerse, Dua, Zikr, Tafsir, QuranAudio
+from models import QuranVerse, Dua, Zikr, Tafsir, QuranAudio, ZikrSession
 import json
 import httpx
 from textwrap import shorten
@@ -1838,6 +1838,131 @@ async def get_zikr(category: str = None, language: str = 'tr', q: str = None):
                 'language': z.language
             } for z in zikrs
         ]
+
+# --- ZikirMatik: Oturum Yönetimi ---
+class ZikrStartRequest(BaseModel):
+    zikr_id: Optional[int] = None
+    title: Optional[str] = None
+    target_count: Optional[int] = None
+
+class ZikrSessionResponse(BaseModel):
+    id: int
+    zikr_id: Optional[int]
+    title: Optional[str]
+    target_count: Optional[int]
+    current_count: int
+    status: str
+    created_at: Optional[str]
+    finished_at: Optional[str]
+
+class ZikrIncrementRequest(BaseModel):
+    amount: Optional[int] = 1
+
+def _serialize_zikr_session(s: ZikrSession) -> dict:
+    return {
+        'id': s.id,
+        'zikr_id': s.zikr_id,
+        'title': s.title,
+        'target_count': s.target_count,
+        'current_count': s.current_count,
+        'status': s.status,
+        'created_at': s.created_at.isoformat() if getattr(s, 'created_at', None) else None,
+        'finished_at': s.finished_at.isoformat() if getattr(s, 'finished_at', None) else None,
+    }
+
+@app.post('/api/zikirmatik/start')
+async def start_zikirmatik(req: ZikrStartRequest, current_user: User = Depends(get_current_user_optional)):
+    async with AsyncSessionLocal() as session:
+        user_id = current_user.id if current_user else None
+        title = req.title
+        target_count = req.target_count
+        zikr_id = req.zikr_id
+        if zikr_id:
+            result = await session.execute(select(Zikr).where(Zikr.id == zikr_id))
+            zikr = result.scalar_one_or_none()
+            if not zikr:
+                raise HTTPException(status_code=404, detail='Zikr bulunamadı')
+            title = title or zikr.title
+            target_count = target_count or zikr.count
+        s = ZikrSession(user_id=user_id, zikr_id=zikr_id, title=title, target_count=target_count, current_count=0, status='active')
+        session.add(s)
+        await session.commit()
+        await session.refresh(s)
+        return _serialize_zikr_session(s)
+
+@app.get('/api/zikirmatik/active')
+async def get_active_zikirmatik(current_user: User = Depends(get_current_user_optional)):
+    async with AsyncSessionLocal() as session:
+        user_id = current_user.id if current_user else None
+        stmt = select(ZikrSession).where(ZikrSession.status == 'active')
+        if user_id is not None:
+            stmt = stmt.where(ZikrSession.user_id == user_id)
+        stmt = stmt.order_by(ZikrSession.created_at.desc())
+        result = await session.execute(stmt)
+        s = result.scalars().first()
+        if not s:
+            return {'active': None}
+        return {'active': _serialize_zikr_session(s)}
+
+@app.post('/api/zikirmatik/{session_id}/increment')
+async def increment_zikirmatik(session_id: int, req: ZikrIncrementRequest, current_user: User = Depends(get_current_user_optional)):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ZikrSession).where(ZikrSession.id == session_id))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(status_code=404, detail='Oturum bulunamadı')
+        amount = req.amount or 1
+        try:
+            amount = int(amount)
+        except Exception:
+            amount = 1
+        s.current_count = (s.current_count or 0) + max(1, amount)
+        await session.commit()
+        await session.refresh(s)
+        return _serialize_zikr_session(s)
+
+@app.post('/api/zikirmatik/{session_id}/finish')
+async def finish_zikirmatik(session_id: int, current_user: User = Depends(get_current_user_optional)):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ZikrSession).where(ZikrSession.id == session_id))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(status_code=404, detail='Oturum bulunamadı')
+        s.status = 'finished'
+        s.finished_at = datetime.utcnow()
+        await session.commit()
+        await session.refresh(s)
+        return _serialize_zikr_session(s)
+
+@app.get('/api/zikirmatik/stats')
+async def zikirmatik_stats(period: str = 'today', current_user: User = Depends(get_current_user_optional)):
+    async with AsyncSessionLocal() as session:
+        user_id = current_user.id if current_user else None
+        now = datetime.utcnow()
+        if period == 'today':
+            start = datetime(now.year, now.month, now.day)
+        elif period == 'week':
+            start = now - timedelta(days=7)
+        elif period == 'month':
+            start = now - timedelta(days=30)
+        else:
+            start = now - timedelta(days=1)
+        stmt = select(ZikrSession).where(ZikrSession.created_at >= start)
+        if user_id is not None:
+            stmt = stmt.where(ZikrSession.user_id == user_id)
+        result = await session.execute(stmt)
+        sessions = result.scalars().all()
+        total = sum((s.current_count or 0) for s in sessions)
+        by_zikr = {}
+        for s in sessions:
+            key = s.zikr_id or s.title or 'Diğer'
+            by_zikr[key] = by_zikr.get(key, 0) + (s.current_count or 0)
+        return {
+            'total': total,
+            'byZikr': [
+                {'key': k, 'total': v} for k, v in sorted(by_zikr.items(), key=lambda x: x[1], reverse=True)
+            ]
+        }
 
 @app.get('/api/tefsir')
 async def get_tefsir(surah: str = None, ayah: int = None, author: str = None, language: str = 'tr', q: str = None):
