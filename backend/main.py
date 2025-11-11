@@ -192,6 +192,8 @@ origins = [
     "http://localhost:8091",      
     "http://localhost:3000",      
     "http://127.0.0.1:8091",      
+    "http://localhost:19006",     # Expo Web (geliştirme) varsayılan portu
+    "http://127.0.0.1:19006",     # Expo Web (geliştirme) 127.0.0.1
     "https://islami-app-backend.onrender.com", 
     # "https://your-frontend-domain.com",  # varsa ekle
 ]
