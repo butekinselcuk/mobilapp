@@ -166,14 +166,15 @@ class Dua(Base):
 class Zikr(Base):
     __tablename__ = 'zikrs'
     id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False)
-    text = Column(Text, nullable=False)
-    translation = Column(Text, nullable=True)
-    count = Column(Integer, nullable=True)  # Tekrar sayısı
+    name = Column(String, nullable=False)
+    slug = Column(String, nullable=True)
     category = Column(String, nullable=True)
-    source_id = Column(Integer, ForeignKey('sources.id'), nullable=True)
-    source = relationship('Source')
+    default_target = Column(Integer, nullable=True)
     language = Column(String, default='tr')
+    is_active = Column(Boolean, default=True)
+    sort_order = Column(Integer, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 class ZikrSession(Base):
     __tablename__ = 'zikr_sessions'
