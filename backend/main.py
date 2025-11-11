@@ -187,23 +187,28 @@ async def on_startup():
     except Exception:
         logging.exception("Startup migrate+seed arka plan görevi başlatılamadı")
 
-# CORS ayarları (geliştirme için tüm kaynaklara izin verildi)
+# CORS ayarları (geliştirme için esnek localhost/127.0.0.1 izinleri)
+# Not: Render üzerinde farklı yerel portlardan (8091, 19006, 8082, 8083 vb.)
+# gelen istekleri kolayca kabul etmek için regex kullanıyoruz.
 origins = [
-    "http://localhost:8091",      
-    "http://localhost:3000",      
-    "http://127.0.0.1:8091",      
+    "http://localhost:8091",
+    "http://127.0.0.1:8091",
+    "http://localhost:3000",
     "http://localhost:19006",     # Expo Web (geliştirme) varsayılan portu
     "http://127.0.0.1:19006",     # Expo Web (geliştirme) 127.0.0.1
-    "https://islami-app-backend.onrender.com", 
+    "http://localhost:8082",      # Expo Web alternatif portlar
+    "http://localhost:8083",
+    "https://islami-app-backend.onrender.com",
     # "https://your-frontend-domain.com",  # varsa ekle
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,      # ⬅️ DEĞİŞİKLİK: 'False' idi, 'True' olmalı.
-    allow_methods=["*"],         # ⬅️ DEĞİŞİKLİK: Daha esnek hale getirildi.
-    allow_headers=["*"],         # ⬅️ DEĞİŞİKLİK: Daha esnek hale getirildi.
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
