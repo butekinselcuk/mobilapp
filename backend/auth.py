@@ -11,6 +11,10 @@ from database import AsyncSessionLocal
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
+import re
+import secrets
+from typing import Optional, Dict
+from datetime import timedelta
 
 load_dotenv()
 
@@ -36,6 +40,22 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# Forgot Password akışı için istek modelleri
+class ForgotStartRequest(BaseModel):
+    email: Optional[str] = None
+    phone: Optional[str] = None  # Şimdilik phone -> username eşleme yapılır
+
+
+class ForgotVerifyRequest(BaseModel):
+    transactionId: str
+    otp: str
+
+
+class ForgotResetRequest(BaseModel):
+    transactionId: str
+    newPassword: str
+
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
@@ -54,6 +74,86 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+# Basit, geçici Forgot store (in‑memory). Prod için veritabanına taşınmalı.
+FORGOT_STORE: Dict[str, Dict] = {}
+
+
+def _generate_otp(length: int = 6) -> str:
+    return ''.join(secrets.choice('0123456789') for _ in range(length))
+
+
+@router.post('/forgot/start')
+async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_db)):
+    # Kullanıcıyı email veya (geçici) phone->username ile bul
+    user = None
+    if req.email:
+        result = await db.execute(select(User).where(User.email == req.email))
+        user = result.scalar_one_or_none()
+    elif req.phone:  # phone mevcut değil; username olarak yorumlanır
+        result = await db.execute(select(User).where(User.username == req.phone))
+        user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=404, detail='Kullanıcı bulunamadı')
+
+    otp = _generate_otp()
+    tid = secrets.token_urlsafe(16)
+    FORGOT_STORE[tid] = {
+        'user_id': user.id,
+        'otp': otp,
+        'expires': datetime.utcnow() + timedelta(minutes=10),
+        'verified': False,
+    }
+    # Not: Gerçekte OTP e‑posta/SMS ile gönderilir. Burada sadece konsola yazıyoruz.
+    print(f"[FORGOT] user_id={user.id} tid={tid} otp={otp}")
+    resp = { 'transactionId': tid }
+    if os.getenv('DEBUG_OTP') == '1':
+        resp['otp'] = otp
+    return resp
+
+
+@router.post('/forgot/verify')
+async def forgot_verify(req: ForgotVerifyRequest):
+    tx = FORGOT_STORE.get(req.transactionId)
+    if not tx:
+        raise HTTPException(status_code=404, detail='İşlem bulunamadı')
+    if datetime.utcnow() > tx['expires']:
+        # Süresi geçtiyse temizle
+        FORGOT_STORE.pop(req.transactionId, None)
+        raise HTTPException(status_code=400, detail='Kodun süresi doldu')
+    if str(req.otp).strip() != tx['otp']:
+        raise HTTPException(status_code=400, detail='Kod geçersiz')
+    tx['verified'] = True
+    return { 'verified': True }
+
+
+@router.post('/forgot/reset')
+async def forgot_reset(req: ForgotResetRequest, db: AsyncSession = Depends(get_db)):
+    tx = FORGOT_STORE.get(req.transactionId)
+    if not tx:
+        raise HTTPException(status_code=404, detail='İşlem bulunamadı')
+    if not tx.get('verified'):
+        raise HTTPException(status_code=400, detail='OTP doğrulaması yapılmadı')
+
+    npw = req.newPassword or ''
+    # Basit kural: en az 8 karakter, harf + rakam içermeli
+    if not (len(npw) >= 8 and re.search(r"[A-Za-z]", npw) and re.search(r"\d", npw)):
+        raise HTTPException(status_code=400, detail='Şifre kuralları sağlanmıyor')
+
+    # Kullanıcının şifresini güncelle
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, tx['user_id'])
+        if not user:
+            FORGOT_STORE.pop(req.transactionId, None)
+            raise HTTPException(status_code=404, detail='Kullanıcı bulunamadı')
+        user.hashed_password = get_password_hash(npw)
+        await session.commit()
+
+    # İşlem temizliği
+    FORGOT_STORE.pop(req.transactionId, None)
+    return { 'success': True }
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
