@@ -62,6 +62,10 @@ class ForgotResetRequest(BaseModel):
     transactionId: str
     newPassword: str
 
+class RegisterVerifyRequest(BaseModel):
+    transactionId: str
+    otp: str
+
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -105,6 +109,7 @@ def is_e164(s: Optional[str]) -> bool:
 
 # Basit, geçici Forgot store (in‑memory). Prod için veritabanına taşınmalı.
 FORGOT_STORE: Dict[str, Dict] = {}
+REGISTER_STORE: Dict[str, Dict] = {}
 
 
 def _generate_otp(length: int = 6) -> str:
@@ -338,6 +343,75 @@ async def forgot_reset(req: ForgotResetRequest, db: AsyncSession = Depends(get_d
     return { 'success': True }
 
 
+@router.post('/register/start')
+async def register_start(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    phone_raw = req.phone or req.username
+    phone = normalize_phone_tr(phone_raw)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Telefon numarası zorunludur.")
+    if not is_e164(phone):
+        raise HTTPException(status_code=400, detail="Telefon numarası geçersiz. Lütfen +90 ile başlayarak girin.")
+
+    result_phone = await db.execute(select(User).where(User.phone == phone))
+    if result_phone.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+    result_username = await db.execute(select(User).where(User.username == phone))
+    if result_username.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+    if req.email:
+        result_email = await db.execute(select(User).where(User.email == req.email))
+        if result_email.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Bu e‑posta ile kullanıcı zaten var.")
+
+    hashed_password = get_password_hash(req.password)
+    otp = _generate_otp()
+    tid = secrets.token_urlsafe(16)
+    REGISTER_STORE[tid] = {
+        'phone': phone,
+        'email': req.email,
+        'hashed_password': hashed_password,
+        'otp': otp,
+        'expires': datetime.utcnow() + timedelta(minutes=10),
+        'verified': False,
+    }
+
+    _send_otp_sms(phone, otp)
+    resp = { 'transactionId': tid, 'requiresVerification': True }
+    if os.getenv('DEBUG_OTP') == '1':
+        resp['otp'] = otp
+    return resp
+
+
+@router.post('/register/verify')
+async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends(get_db)):
+    tx = REGISTER_STORE.get(req.transactionId)
+    if not tx:
+        raise HTTPException(status_code=404, detail='İşlem bulunamadı')
+    if datetime.utcnow() > tx['expires']:
+        REGISTER_STORE.pop(req.transactionId, None)
+        raise HTTPException(status_code=400, detail='Kodun süresi doldu')
+    if str(req.otp).strip() != tx['otp']:
+        raise HTTPException(status_code=400, detail='Kod geçersiz')
+
+    new_user = User(username=tx['phone'], phone=tx['phone'], email=tx.get('email'), hashed_password=tx['hashed_password'])
+    db.add(new_user)
+    try:
+        await db.commit()
+        await db.refresh(new_user)
+    except IntegrityError as e:
+        await db.rollback()
+        msg = str(getattr(e, 'orig', e))
+        if 'users_email_key' in msg:
+            raise HTTPException(status_code=400, detail="Bu e‑posta ile kullanıcı zaten var.")
+        if 'users_username_key' in msg or 'users_phone_key' in msg:
+            raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+        raise HTTPException(status_code=400, detail="Kayıt sırasında beklenmeyen bir hata oluştu.")
+    finally:
+        REGISTER_STORE.pop(req.transactionId, None)
+
+    return {"msg": "Kayıt başarılı."}
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -378,6 +452,8 @@ async def get_current_user_optional(token: str = Depends(oauth2_scheme_optional)
 
 @router.post('/register')
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    if os.getenv('REQUIRE_SMS_VERIFICATION', '0') == '1':
+        return await register_start(req, db)
     # Telefon zorunlu: username verilmişse telefon olarak kabul edelim (geri uyumluluk)
     phone_raw = req.phone or req.username
     phone = normalize_phone_tr(phone_raw)
