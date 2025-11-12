@@ -14,6 +14,10 @@ from pydantic import BaseModel
 import re
 import secrets
 from typing import Optional, Dict
+import smtplib
+import ssl
+from email.message import EmailMessage
+import requests
 from datetime import timedelta
 
 load_dotenv()
@@ -84,6 +88,108 @@ def _generate_otp(length: int = 6) -> str:
     return ''.join(secrets.choice('0123456789') for _ in range(length))
 
 
+def _send_otp_email(recipient: str, otp: str):
+    """Basit SMTP ile OTP e‑posta gönderimi.
+
+    Ortam değişkenleri:
+      - SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD
+      - EMAIL_FROM (opsiyonel)
+      - SMTP_USE_SSL (0/1), SMTP_USE_TLS (0/1)
+      - EMAIL_DRY_RUN (1 ise gerçek gönderim yapılmaz, sadece log)
+    """
+    try:
+        if os.getenv('EMAIL_DRY_RUN', '0') == '1':
+            print(f"[EMAIL_DRY_RUN] OTP {otp} -> {recipient}")
+            return
+
+        host = os.getenv('SMTP_HOST')
+        port = int(os.getenv('SMTP_PORT', '587'))
+        user = os.getenv('SMTP_USERNAME')
+        password = os.getenv('SMTP_PASSWORD')
+        from_addr = os.getenv('EMAIL_FROM', user or 'noreply@example.com')
+        use_ssl = os.getenv('SMTP_USE_SSL', '0') == '1'
+        use_tls = os.getenv('SMTP_USE_TLS', '1') == '1'
+
+        if not host or not user or not password:
+            print('[EMAIL] SMTP yapılandırılmamış; gönderim atlandı.')
+            return
+
+        msg = EmailMessage()
+        msg['Subject'] = 'Şifre Sıfırlama Kodunuz'
+        msg['From'] = from_addr
+        msg['To'] = recipient
+        msg.set_content(f"Şifre sıfırlama kodunuz: {otp}\nBu kodu 10 dakika içinde kullanın.")
+
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port) as server:
+                server.ehlo()
+                if use_tls:
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                server.login(user, password)
+                server.send_message(msg)
+        print(f"[EMAIL] OTP e‑posta gönderildi -> {recipient}")
+    except Exception as e:
+        print(f"[EMAIL] OTP e‑posta gönderilemedi -> {recipient} | hata: {e}")
+
+
+def _send_otp_sms(recipient: str, otp: str):
+    """Twilio ile OTP SMS gönderimi.
+
+    Gerekli ortam değişkenleri:
+      - TWILIO_ACCOUNT_SID
+      - TWILIO_AUTH_TOKEN (veya TWILIO_API_KEY_SID + TWILIO_API_KEY_SECRET)
+      - TWILIO_MESSAGING_SERVICE_SID (tercih edilir) veya TWILIO_FROM_NUMBER
+      - SMS_DRY_RUN=1 ise gerçek gönderim yapılmaz.
+    """
+    try:
+        if os.getenv('SMS_DRY_RUN', '0') == '1':
+            print(f"[SMS_DRY_RUN] OTP {otp} -> {recipient}")
+            return
+
+        account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+        api_key_sid = os.getenv('TWILIO_API_KEY_SID')
+        api_key_secret = os.getenv('TWILIO_API_KEY_SECRET')
+        messaging_service_sid = os.getenv('TWILIO_MESSAGING_SERVICE_SID')
+        from_number = os.getenv('TWILIO_FROM_NUMBER')
+
+        if not account_sid:
+            print('[SMS] Twilio ACCOUNT SID eksik; gönderim atlandı.')
+            return
+        # Kimlik: API key varsa onu kullan, yoksa klasik Auth Token.
+        username = (api_key_sid or account_sid)
+        password = (api_key_secret or auth_token)
+        if not password:
+            print('[SMS] Twilio kimlik bilgileri eksik; gönderim atlandı.')
+            return
+        if not (messaging_service_sid or from_number):
+            print('[SMS] TWILIO_MESSAGING_SERVICE_SID veya TWILIO_FROM_NUMBER gerekli; gönderim atlandı.')
+            return
+
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+        data = {
+            'To': recipient,
+            'Body': f'Sifre sifirlama kodunuz: {otp}. 10 dakika icinde kullanin.'
+        }
+        if messaging_service_sid:
+            data['MessagingServiceSid'] = messaging_service_sid
+        else:
+            data['From'] = from_number
+
+        resp = requests.post(url, data=data, auth=(username, password), timeout=10)
+        if resp.status_code >= 400:
+            print(f"[SMS] Gönderim hatası -> status={resp.status_code} body={resp.text}")
+        else:
+            print(f"[SMS] OTP SMS gönderildi -> {recipient}")
+    except Exception as e:
+        print(f"[SMS] OTP SMS gönderilemedi -> {recipient} | hata: {e}")
+
+
 @router.post('/forgot/start')
 async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_db)):
     # Kullanıcıyı email veya (geçici) phone->username ile bul
@@ -106,7 +212,12 @@ async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_d
         'expires': datetime.utcnow() + timedelta(minutes=10),
         'verified': False,
     }
-    # Not: Gerçekte OTP e‑posta/SMS ile gönderilir. Burada sadece konsola yazıyoruz.
+    # OTP gönderimi
+    if req.email:
+        _send_otp_email(req.email, otp)
+    if req.phone:
+        _send_otp_sms(req.phone, otp)
+    # Geliştirme amaçlı log
     print(f"[FORGOT] user_id={user.id} tid={tid} otp={otp}")
     resp = { 'transactionId': tid }
     if os.getenv('DEBUG_OTP') == '1':
