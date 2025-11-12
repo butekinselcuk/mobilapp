@@ -831,6 +831,8 @@ async def update_setting(req: SettingUpdateRequest, current_user: User = Depends
 class UserUpdateRequest(BaseModel):
     username: Optional[str] = None
     email: Optional[EmailStr] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
 
 class ChangePasswordRequest(BaseModel):
     old_password: str
@@ -847,8 +849,18 @@ async def update_user_profile(req: UserUpdateRequest, current_user: User = Depen
             user.username = req.username
         if req.email:
             user.email = req.email
+        if req.first_name is not None:
+            user.first_name = req.first_name
+        if req.last_name is not None:
+            user.last_name = req.last_name
         await session.commit()
-        return {"status": "updated", "username": user.username, "email": user.email}
+        return {
+            "status": "updated",
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+        }
 
 @app.post("/user/change_password")
 async def change_password(req: ChangePasswordRequest, current_user: User = Depends(get_current_user)):
@@ -1836,7 +1848,7 @@ async def get_dua(category: str = None, language: str = 'tr', q: str = None):
         ]
 
 @app.get('/api/zikr')
-async def get_zikr(category: str = None, language: str = 'tr', q: str = None):
+async def get_zikr(category: str = None, language: str = 'tr', q: str = None, current_user: User = Depends(get_current_user_optional)):
     async with AsyncSessionLocal() as session:
         query = select(Zikr)
         if category:
@@ -1848,13 +1860,32 @@ async def get_zikr(category: str = None, language: str = 'tr', q: str = None):
             query = query.where(or_(Zikr.name.ilike(like), Zikr.slug.ilike(like)))
         result = await session.execute(query)
         zikrs = result.scalars().all()
+
+        user_id = current_user.id if current_user else None
+        progress_map = {}
+        if user_id is not None and zikrs:
+            ids = [z.id for z in zikrs]
+            sess_stmt = select(ZikrSession).where(
+                ZikrSession.user_id == user_id,
+                ZikrSession.status == 'active',
+                ZikrSession.zikr_id.in_(ids)
+            )
+            sess_res = await session.execute(sess_stmt)
+            for s in sess_res.scalars().all():
+                progress_map[s.zikr_id] = {
+                    'current': s.current_count or 0,
+                    'remaining': max((s.target_count or (next((z.default_target for z in zikrs if z.id == s.zikr_id), 33))) - (s.current_count or 0), 0)
+                }
+
         return [
             {
                 'id': z.id,
                 'title': z.name,
                 'count': z.default_target,
                 'category': z.category,
-                'language': z.language
+                'language': z.language,
+                'current': progress_map.get(z.id, {}).get('current', 0) if user_id is not None else None,
+                'remaining': progress_map.get(z.id, {}).get('remaining', z.default_target) if user_id is not None else None,
             } for z in zikrs
         ]
 
@@ -1896,6 +1927,27 @@ async def start_zikirmatik(req: ZikrStartRequest, current_user: User = Depends(g
         title = req.title
         target_count = req.target_count
         zikr_id = req.zikr_id
+
+        # Eğer aynı kullanıcı için aynı zikr'den aktif oturum varsa, onu döndür (yeni başlatma yok)
+        try:
+            existing_stmt = select(ZikrSession).where(ZikrSession.status == 'active')
+            if user_id is not None:
+                existing_stmt = existing_stmt.where(ZikrSession.user_id == user_id)
+            if zikr_id is not None:
+                existing_stmt = existing_stmt.where(ZikrSession.zikr_id == zikr_id)
+            else:
+                # serbest oturumlarda başlık eşleşmesiyle devam et (isteğe bağlı)
+                if title:
+                    existing_stmt = existing_stmt.where(ZikrSession.title == title)
+            existing_stmt = existing_stmt.order_by(ZikrSession.created_at.desc())
+            existing_res = await session.execute(existing_stmt)
+            existing = existing_res.scalars().first()
+            if existing:
+                return _serialize_zikr_session(existing)
+        except Exception as e:
+            # mevcut kontrolü başarısızsa yine de yeni oturum dene; logla
+            print(f"[WARN][ZIKR_START_CHECK] existing active kontrolünde hata: {e}")
+
         if zikr_id:
             result = await session.execute(select(Zikr).where(Zikr.id == zikr_id))
             zikr = result.scalar_one_or_none()
@@ -1914,6 +1966,7 @@ async def start_zikirmatik(req: ZikrStartRequest, current_user: User = Depends(g
                 target_count = int(target_count or 33)
             except Exception:
                 target_count = 33
+
         s = ZikrSession(user_id=user_id, zikr_id=zikr_id, title=title, target_count=target_count, current_count=0, status='active')
         try:
             session.add(s)
@@ -1952,7 +2005,11 @@ async def increment_zikirmatik(session_id: int, req: ZikrIncrementRequest, curre
         except Exception:
             amount = 1
         s.current_count = (s.current_count or 0) + max(1, amount)
+        # Hedefe ulaşıldıysa otomatik bitir
         try:
+            if s.target_count is not None and s.current_count >= s.target_count and s.status != 'finished':
+                s.status = 'finished'
+                s.finished_at = datetime.utcnow()
             await session.commit()
             await session.refresh(s)
             return _serialize_zikr_session(s)
@@ -1997,16 +2054,48 @@ async def zikirmatik_stats(period: str = 'today', current_user: User = Depends(g
             stmt = stmt.where(ZikrSession.user_id == user_id)
         result = await session.execute(stmt)
         sessions = result.scalars().all()
+
         total = sum((s.current_count or 0) for s in sessions)
-        by_zikr = {}
+        # Zikir bazında ayrıntılı gruplama
+        groups = {}
         for s in sessions:
             key = s.zikr_id or s.title or 'Diğer'
-            by_zikr[key] = by_zikr.get(key, 0) + (s.current_count or 0)
+            g = groups.get(key)
+            if not g:
+                g = {
+                    'zikr_id': s.zikr_id,
+                    'title': s.title,
+                    'total_count': 0,
+                    'sessions_active': 0,
+                    'sessions_finished': 0,
+                    'last_activity': None,
+                }
+            g['total_count'] += (s.current_count or 0)
+            if s.status == 'finished':
+                g['sessions_finished'] += 1
+            else:
+                g['sessions_active'] += 1
+            ts = s.finished_at or s.created_at
+            if ts:
+                if not g['last_activity'] or ts > g['last_activity']:
+                    g['last_activity'] = ts
+            groups[key] = g
+
+        by_zikr = [
+            {
+                'zikr_id': v['zikr_id'],
+                'title': v['title'],
+                'total_count': v['total_count'],
+                'sessions_active': v['sessions_active'],
+                'sessions_finished': v['sessions_finished'],
+                'last_activity': v['last_activity'].isoformat() if v['last_activity'] else None,
+            }
+            for _, v in sorted(groups.items(), key=lambda x: x[1]['total_count'], reverse=True)
+        ]
+
         return {
             'total': total,
-            'byZikr': [
-                {'key': k, 'total': v} for k, v in sorted(by_zikr.items(), key=lambda x: x[1], reverse=True)
-            ]
+            'byZikr': by_zikr
         }
 
 @app.get('/api/tefsir')
@@ -2124,6 +2213,9 @@ async def get_user_profile(current_user: User = Depends(get_current_user)):
     return {
         "username": current_user.username,
         "email": current_user.email,
+        "phone": getattr(current_user, "phone", None),
+        "first_name": getattr(current_user, "first_name", None),
+        "last_name": getattr(current_user, "last_name", None),
         "is_admin": current_user.is_admin,
         "isPremium": current_user.is_premium,
         "premium_expiry": current_user.premium_expiry.isoformat() if current_user.premium_expiry else None,
