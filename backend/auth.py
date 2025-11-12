@@ -34,9 +34,11 @@ oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error
 
 
 class RegisterRequest(BaseModel):
-    username: str
+    # Telefonla kayıt: phone zorunlu, e‑posta ve şifre zorunlu; username opsiyonel (geri uyumluluk)
+    phone: Optional[str] = None
     email: str
     password: str
+    username: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -78,6 +80,26 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+# Telefon normalizasyonu ve doğrulama yardımcıları
+def normalize_phone_tr(raw: str | None) -> Optional[str]:
+    """Türkiye numaralarını E.164 biçimine (örn. +905XXXXXXXXX) normalize eder."""
+    if raw is None:
+        return None
+    s = raw.strip().replace(" ", "").replace("-", "")
+    if s.startswith("00"):
+        s = "+" + s[2:]
+    if s.startswith("0"):
+        s = "+90" + s[1:]
+    if s.startswith("90") and not s.startswith("+90"):
+        s = "+" + s
+    s = re.sub(r"[^\d\+]", "", s)
+    return s
+
+
+def is_e164(s: Optional[str]) -> bool:
+    return bool(re.fullmatch(r"\+\d{8,15}", (s or "")))
 
 
 # Basit, geçici Forgot store (in‑memory). Prod için veritabanına taşınmalı.
@@ -241,8 +263,9 @@ async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_d
     if req.email:
         result = await db.execute(select(User).where(User.email == req.email))
         user = result.scalar_one_or_none()
-    elif req.phone:  # phone mevcut değil; username olarak yorumlanır
-        result = await db.execute(select(User).where(User.username == req.phone))
+    elif req.phone:  # phone artık User.phone alanıyla eşleşir
+        phone = normalize_phone_tr(req.phone)
+        result = await db.execute(select(User).where(User.phone == phone))
         user = result.scalar_one_or_none()
 
     if not user:
@@ -261,7 +284,7 @@ async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_d
         _send_otp_email(req.email, otp)
     sms_sid = None
     if req.phone:
-        sms_sid = _send_otp_sms(req.phone, otp)
+        sms_sid = _send_otp_sms(normalize_phone_tr(req.phone), otp)
     # Geliştirme amaçlı log
     print(f"[FORGOT] user_id={user.id} tid={tid} otp={otp}")
     resp = { 'transactionId': tid }
@@ -354,14 +377,23 @@ async def get_current_user_optional(token: str = Depends(oauth2_scheme_optional)
 
 @router.post('/register')
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where((User.username == req.username) | (User.email == req.email)))
-    user = result.scalar_one_or_none()
+    # Telefon zorunlu: username verilmişse telefon olarak kabul edelim (geri uyumluluk)
+    phone_raw = req.phone or req.username
+    phone = normalize_phone_tr(phone_raw)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Telefon numarası zorunludur.")
+    if not is_e164(phone):
+        raise HTTPException(status_code=400, detail="Telefon numarası geçersiz. Lütfen +90 ile başlayarak girin.")
 
+    # Uniqueness: phone veya email zaten kayıtlı mı?
+    result = await db.execute(select(User).where((User.phone == phone) | (User.email == req.email)))
+    user = result.scalar_one_or_none()
     if user:
-        raise HTTPException(status_code=400, detail="Kullanıcı adı veya e-posta zaten kayıtlı.")
+        raise HTTPException(status_code=400, detail="Bu telefon veya e‑posta ile kullanıcı zaten var.")
 
     hashed_password = get_password_hash(req.password)
-    new_user = User(username=req.username, email=req.email, hashed_password=hashed_password)
+    # username alanını da telefon ile hizalı tutuyoruz (tokenlar ve mevcut akış için)
+    new_user = User(username=phone, phone=phone, email=req.email, hashed_password=hashed_password)
 
     db.add(new_user)
     await db.commit()
@@ -376,11 +408,13 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post('/login')
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
-    
     print("--- LOGIN FONKSİYONU BAŞLADI ---")
-    print(f"Kullanıcı aranıyor: {req.username}")
-    
-    result = await db.execute(select(User).where(User.username == req.username))
+    phone = normalize_phone_tr(req.username)
+    print(f"Kullanıcı aranıyor (telefon): {phone}")
+    if not is_e164(phone):
+        return JSONResponse(status_code=400, content={"detail": "Lütfen telefonunuzu +90 ile başlayarak girin"})
+
+    result = await db.execute(select(User).where(User.phone == phone))
     user = result.scalar_one_or_none()
 
     if not user:
