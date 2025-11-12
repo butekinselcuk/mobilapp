@@ -7,6 +7,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
+    # Telefon numarası (E.164 biçiminde, örn. +905XXXXXXXXX)
+    phone = Column(String, unique=True, index=True, nullable=True)
     hashed_password = Column(String, nullable=False)
     is_admin = Column(Boolean, default=False)  # Admin kullanıcı mı?
     is_premium = Column(Boolean, default=False)  # Premium kullanıcı mı?
@@ -14,6 +16,9 @@ class User(Base):
     # Profil özelleştirme alanları
     theme_preference = Column(String, nullable=True)  # 'light' | 'dark'
     avatar_url = Column(String, nullable=True)        # Yüklenen avatar dosyasının URL'si
+    # Kişisel alanlar
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
     questions = relationship('Question', back_populates='user')
     question_history = relationship('UserQuestionHistory', back_populates='user', cascade='all, delete-orphan')
     favorite_hadiths = relationship('UserFavoriteHadith', back_populates='user', cascade='all, delete-orphan')
