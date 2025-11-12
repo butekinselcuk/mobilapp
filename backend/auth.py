@@ -67,6 +67,10 @@ class RegisterVerifyRequest(BaseModel):
     otp: str
 
 
+class RegisterResendRequest(BaseModel):
+    transactionId: str
+
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
@@ -373,9 +377,13 @@ async def register_start(req: RegisterRequest, db: AsyncSession = Depends(get_db
         'otp': otp,
         'expires': datetime.utcnow() + timedelta(minutes=10),
         'verified': False,
+        'resend_count': 0,
+        'last_resend_at': None,
     }
 
+    # İlk OTP gönderimi ve zaman damgası
     _send_otp_sms(phone, otp)
+    REGISTER_STORE[tid]['last_resend_at'] = datetime.utcnow()
     resp = { 'transactionId': tid, 'requiresVerification': True }
     if os.getenv('DEBUG_OTP') == '1':
         resp['otp'] = otp
@@ -410,6 +418,47 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
         REGISTER_STORE.pop(req.transactionId, None)
 
     return {"msg": "Kayıt başarılı."}
+
+
+@router.post('/register/resend')
+async def register_resend(req: RegisterResendRequest):
+    tx = REGISTER_STORE.get(req.transactionId)
+    if not tx:
+        raise HTTPException(status_code=404, detail='İşlem bulunamadı')
+    # Süre kontrolü
+    if datetime.utcnow() > tx['expires']:
+        REGISTER_STORE.pop(req.transactionId, None)
+        raise HTTPException(status_code=400, detail='Kodun süresi doldu')
+
+    # Limitler
+    cooldown_seconds = int(os.getenv('OTP_RESEND_COOLDOWN_SECONDS', '60'))
+    max_attempts = int(os.getenv('OTP_RESEND_MAX_ATTEMPTS', '3'))
+
+    last = tx.get('last_resend_at')
+    resend_count = int(tx.get('resend_count', 0))
+
+    if last is not None:
+        elapsed = (datetime.utcnow() - last).total_seconds()
+        if elapsed < cooldown_seconds:
+            wait = int(cooldown_seconds - elapsed)
+            return JSONResponse(status_code=429, content={
+                'detail': 'Tekrar göndermek için lütfen bekleyin.',
+                'resendAvailableIn': wait
+            })
+
+    if resend_count >= max_attempts:
+        return JSONResponse(status_code=429, content={
+            'detail': 'Maksimum tekrar gönderim sayısına ulaşıldı.'
+        })
+
+    sid = _send_otp_sms(tx['phone'], tx['otp'])
+    tx['last_resend_at'] = datetime.utcnow()
+    tx['resend_count'] = resend_count + 1
+
+    resp = { 'success': True, 'resendAvailableIn': cooldown_seconds }
+    if sid:
+        resp['smsMessageSid'] = sid
+    return resp
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
