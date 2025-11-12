@@ -19,6 +19,7 @@ import ssl
 from email.message import EmailMessage
 import requests
 from datetime import timedelta
+from sqlalchemy.exc import IntegrityError
 
 load_dotenv()
 
@@ -385,10 +386,16 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if not is_e164(phone):
         raise HTTPException(status_code=400, detail="Telefon numarası geçersiz. Lütfen +90 ile başlayarak girin.")
 
-    # Uniqueness: önce telefon; email sağlandıysa ayrıca kontrol et
+    # Uniqueness: önce telefon; ayrıca username=phone çakışmasını da kontrol et
     result_phone = await db.execute(select(User).where(User.phone == phone))
     user_phone = result_phone.scalar_one_or_none()
     if user_phone:
+        raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+
+    # Eski verilerde username telefonla eşit olabilir; çakışmayı önle
+    result_username = await db.execute(select(User).where(User.username == phone))
+    user_username = result_username.scalar_one_or_none()
+    if user_username:
         raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
 
     if req.email:
@@ -402,8 +409,19 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     new_user = User(username=phone, phone=phone, email=req.email, hashed_password=hashed_password)
 
     db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
+    try:
+        await db.commit()
+        await db.refresh(new_user)
+    except IntegrityError as e:
+        await db.rollback()
+        msg = str(getattr(e, 'orig', e))
+        # Hangi unique kısıt kırıldıysa buna göre mesaj döndür
+        if 'users_email_key' in msg:
+            raise HTTPException(status_code=400, detail="Bu e‑posta ile kullanıcı zaten var.")
+        if 'users_username_key' in msg or 'users_phone_key' in msg:
+            raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+        # Varsayılan: kayıt başarısız
+        raise HTTPException(status_code=400, detail="Kayıt sırasında beklenmeyen bir hata oluştu.")
 
     return {"msg": "Kayıt başarılı."}
 
