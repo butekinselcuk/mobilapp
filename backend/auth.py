@@ -34,9 +34,9 @@ oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error
 
 
 class RegisterRequest(BaseModel):
-    # Telefonla kayıt: phone zorunlu, e‑posta ve şifre zorunlu; username opsiyonel (geri uyumluluk)
+    # Telefonla kayıt: phone zorunlu; email artık opsiyonel; username opsiyonel (geri uyumluluk)
     phone: Optional[str] = None
-    email: str
+    email: Optional[str] = None
     password: str
     username: Optional[str] = None
 
@@ -385,11 +385,17 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if not is_e164(phone):
         raise HTTPException(status_code=400, detail="Telefon numarası geçersiz. Lütfen +90 ile başlayarak girin.")
 
-    # Uniqueness: phone veya email zaten kayıtlı mı?
-    result = await db.execute(select(User).where((User.phone == phone) | (User.email == req.email)))
-    user = result.scalar_one_or_none()
-    if user:
-        raise HTTPException(status_code=400, detail="Bu telefon veya e‑posta ile kullanıcı zaten var.")
+    # Uniqueness: önce telefon; email sağlandıysa ayrıca kontrol et
+    result_phone = await db.execute(select(User).where(User.phone == phone))
+    user_phone = result_phone.scalar_one_or_none()
+    if user_phone:
+        raise HTTPException(status_code=400, detail="Bu telefon ile kullanıcı zaten var.")
+
+    if req.email:
+        result_email = await db.execute(select(User).where(User.email == req.email))
+        user_email = result_email.scalar_one_or_none()
+        if user_email:
+            raise HTTPException(status_code=400, detail="Bu e‑posta ile kullanıcı zaten var.")
 
     hashed_password = get_password_hash(req.password)
     # username alanını da telefon ile hizalı tutuyoruz (tokenlar ve mevcut akış için)
