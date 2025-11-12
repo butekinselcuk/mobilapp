@@ -141,53 +141,97 @@ def _send_otp_sms(recipient: str, otp: str):
     """Twilio ile OTP SMS gönderimi.
 
     Gerekli ortam değişkenleri:
-      - TWILIO_ACCOUNT_SID
-      - TWILIO_AUTH_TOKEN (veya TWILIO_API_KEY_SID + TWILIO_API_KEY_SECRET)
-      - TWILIO_MESSAGING_SERVICE_SID (tercih edilir) veya TWILIO_FROM_NUMBER
-      - SMS_DRY_RUN=1 ise gerçek gönderim yapılmaz.
+      - `TWILIO_ACCOUNT_SID`
+      - `TWILIO_AUTH_TOKEN` (veya `TWILIO_API_KEY_SID` + `TWILIO_API_KEY_SECRET`)
+      - `TWILIO_MESSAGING_SERVICE_SID` (tercih edilir) veya `TWILIO_FROM_NUMBER`
+      - `TWILIO_STATUS_CALLBACK_URL` (opsiyonel, teslimat olayları için)
+      - `SMS_DRY_RUN=1` ise gerçek gönderim yapılmaz.
+
+    Döndürür: Başarılıysa Twilio Message SID, değilse None.
     """
     try:
         if os.getenv('SMS_DRY_RUN', '0') == '1':
             print(f"[SMS_DRY_RUN] OTP {otp} -> {recipient}")
-            return
+            return None
 
         account_sid = os.getenv('TWILIO_ACCOUNT_SID')
         auth_token = os.getenv('TWILIO_AUTH_TOKEN')
         api_key_sid = os.getenv('TWILIO_API_KEY_SID')
         api_key_secret = os.getenv('TWILIO_API_KEY_SECRET')
-        messaging_service_sid = os.getenv('TWILIO_MESSAGING_SERVICE_SID')
-        from_number = os.getenv('TWILIO_FROM_NUMBER')
+        # Ortam değişkenleri: farklı adlara karşı geriye dönük uyumluluk
+        messaging_service_sid = (
+            os.getenv('TWILIO_MESSAGING_SERVICE_SID')
+            or os.getenv('MESSAGING_SERVICE_SID')
+        )
+        from_number = (
+            os.getenv('TWILIO_FROM_NUMBER')
+            or os.getenv('FROM_NUMBER')
+        )
+        status_cb = os.getenv('TWILIO_STATUS_CALLBACK_URL')
+
+        # Yapılandırma özeti (gizli değerler hariç)
+        print(
+            "[SMS] Config -> "
+            f"acct_sid={'SET' if account_sid else 'MISSING'}, "
+            f"auth={'API_KEY' if api_key_sid and api_key_secret else ('TOKEN' if auth_token else 'MISSING')}, "
+            f"svc_sid={'SET' if messaging_service_sid else 'MISSING'}, "
+            f"from={'SET' if from_number else 'MISSING'}"
+        )
 
         if not account_sid:
             print('[SMS] Twilio ACCOUNT SID eksik; gönderim atlandı.')
-            return
+            return None
         # Kimlik: API key varsa onu kullan, yoksa klasik Auth Token.
         username = (api_key_sid or account_sid)
         password = (api_key_secret or auth_token)
         if not password:
             print('[SMS] Twilio kimlik bilgileri eksik; gönderim atlandı.')
-            return
+            return None
         if not (messaging_service_sid or from_number):
             print('[SMS] TWILIO_MESSAGING_SERVICE_SID veya TWILIO_FROM_NUMBER gerekli; gönderim atlandı.')
-            return
+            return None
 
         url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
         data = {
             'To': recipient,
+            # Türkçe karakterlerde taşıyıcı kodlaması sorun çıkarabilir; güvenli ASCII kullanıyoruz.
             'Body': f'Sifre sifirlama kodunuz: {otp}. 10 dakika icinde kullanin.'
         }
         if messaging_service_sid:
             data['MessagingServiceSid'] = messaging_service_sid
+            print(f"[SMS] MessagingService üzerinden gönderiliyor (SID set).")
         else:
             data['From'] = from_number
+            print(f"[SMS] Doğrudan From numarasıyla gönderiliyor: {from_number}")
+
+        if status_cb:
+            data['StatusCallback'] = status_cb
+            print(f"[SMS] StatusCallback etkin: {status_cb}")
 
         resp = requests.post(url, data=data, auth=(username, password), timeout=10)
+        ct = resp.headers.get('Content-Type', '')
         if resp.status_code >= 400:
-            print(f"[SMS] Gönderim hatası -> status={resp.status_code} body={resp.text}")
+            err_body = resp.text
+            try:
+                # Twilio genelde hata gövdesine JSON döner {code, message}
+                j = resp.json()
+                code = j.get('code')
+                msg = j.get('message')
+                print(f"[SMS] Gönderim hatası -> status={resp.status_code} code={code} msg={msg}")
+            except Exception:
+                print(f"[SMS] Gönderim hatası -> status={resp.status_code} body={err_body[:200]}")
+            return None
         else:
-            print(f"[SMS] OTP SMS gönderildi -> {recipient}")
+            sid = None
+            try:
+                sid = resp.json().get('sid')
+            except Exception:
+                pass
+            print(f"[SMS] OTP SMS gönderildi -> {recipient} | sid={sid}")
+            return sid
     except Exception as e:
         print(f"[SMS] OTP SMS gönderilemedi -> {recipient} | hata: {e}")
+        return None
 
 
 @router.post('/forgot/start')
@@ -215,11 +259,14 @@ async def forgot_start(req: ForgotStartRequest, db: AsyncSession = Depends(get_d
     # OTP gönderimi
     if req.email:
         _send_otp_email(req.email, otp)
+    sms_sid = None
     if req.phone:
-        _send_otp_sms(req.phone, otp)
+        sms_sid = _send_otp_sms(req.phone, otp)
     # Geliştirme amaçlı log
     print(f"[FORGOT] user_id={user.id} tid={tid} otp={otp}")
     resp = { 'transactionId': tid }
+    if sms_sid:
+        resp['smsMessageSid'] = sms_sid
     if os.getenv('DEBUG_OTP') == '1':
         resp['otp'] = otp
     return resp
