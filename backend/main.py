@@ -826,7 +826,34 @@ async def update_setting(req: SettingUpdateRequest, current_user: User = Depends
             setting = Setting(key=req.key, value=req.value)
             session.add(setting)
         await session.commit()
-        return {"key": req.key, "value": req.value} 
+        return {"key": req.key, "value": req.value}
+
+@app.get("/settings")
+async def public_settings():
+    bases = [
+        "terms_content",
+        "kvkk_content",
+        "privacy_content",
+        "cookies_content",
+        "resources_content",
+        "app_name",
+    ]
+    langs = ["tr", "en", "ar"]
+    # Beyaz liste: dil spesifik + genel firma bilgileri
+    allowed_keys = [
+        "company_name",
+        "company_address",
+        "company_email",
+        "company_website",
+    ]
+    for b in bases:
+        allowed_keys.append(b)
+        for l in langs:
+            allowed_keys.append(f"{b}_{l}")
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Setting).where(Setting.key.in_(allowed_keys)))
+        settings = result.scalars().all()
+        return [{"key": s.key, "value": s.value} for s in settings]
 
 class UserUpdateRequest(BaseModel):
     username: Optional[str] = None
