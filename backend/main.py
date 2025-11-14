@@ -2455,3 +2455,51 @@ async def _get_sequence_name(session, tbl: str, col: str) -> str:
         await session.execute(text(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{fallback_seq}'::regclass)"))
         seq_name = fallback_seq
     return seq_name
+@app.get("/settings/resolved")
+async def settings_resolved(lang: str = "tr"):
+    bases = [
+        "terms_content",
+        "kvkk_content",
+        "privacy_content",
+        "cookies_content",
+        "resources_content",
+        "app_name",
+    ]
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Setting))
+        settings = result.scalars().all()
+        m = {s.key: s.value for s in settings}
+        def pick(key):
+            return m.get(f"{key}_{lang}") or m.get(key) or ""
+        app_name = pick("app_name")
+        company_name = m.get("company_name", "")
+        company_email = m.get("company_email", "")
+        company_website = m.get("company_website", "")
+        company_address = m.get("company_address", "")
+        pairs = [
+            ("[Uygulama Adı]", app_name),
+            ("[Şirket Adı]", company_name),
+            ("[E-posta]", company_email),
+            ("[E‑posta]", company_email),
+            ("[Web Sitesi]", company_website),
+            ("[Adres]", company_address),
+        ]
+        def apply_vars(s):
+            out = str(s or "")
+            for k, v in pairs:
+                if v:
+                    out = out.replace(k, str(v))
+            return out
+        return {
+            "app_name": app_name,
+            "terms_content": apply_vars(pick("terms_content")),
+            "kvkk_content": apply_vars(pick("kvkk_content")),
+            "privacy_content": apply_vars(pick("privacy_content")),
+            "cookies_content": apply_vars(pick("cookies_content")),
+            "resources_content": apply_vars(pick("resources_content")),
+            "company_name": company_name,
+            "company_email": company_email,
+            "company_website": company_website,
+            "company_address": company_address,
+            "lang": lang,
+        }
