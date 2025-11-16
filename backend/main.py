@@ -846,6 +846,13 @@ async def public_settings():
         "company_email",
         "company_website",
     ]
+    for l in langs:
+        allowed_keys.extend([
+            f"company_name_{l}",
+            f"company_address_{l}",
+            f"company_email_{l}",
+            f"company_website_{l}",
+        ])
     for b in bases:
         allowed_keys.append(b)
         for l in langs:
@@ -2472,10 +2479,10 @@ async def settings_resolved(lang: str = "tr"):
         def pick(key):
             return m.get(f"{key}_{lang}") or m.get(key) or ""
         app_name = pick("app_name")
-        company_name = m.get("company_name", "")
-        company_email = m.get("company_email", "")
-        company_website = m.get("company_website", "")
-        company_address = m.get("company_address", "")
+        company_name = pick("company_name")
+        company_email = pick("company_email")
+        company_website = pick("company_website")
+        company_address = pick("company_address")
         pairs = [
             ("[Uygulama Adı]", app_name),
             ("[Şirket Adı]", company_name),
