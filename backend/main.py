@@ -2493,7 +2493,24 @@ async def settings_resolved(lang: str = "tr"):
         ]
         def apply_vars(s):
             out = str(s or "")
-            for k, v in pairs:
+            tokens = {
+                "[Uygulama Adı]": app_name,
+                "{app_name}": app_name,
+                "[Şirket Adı]": company_name,
+                "{company_name}": company_name,
+                "[E-posta]": company_email,
+                "[E‑posta]": company_email,
+                "{company_email}": company_email,
+                "{email}": company_email,
+                "{mail}": company_email,
+                "[Web Sitesi]": company_website,
+                "{company_website}": company_website,
+                "{website}": company_website,
+                "{web}": company_website,
+                "[Adres]": company_address,
+                "{company_address}": company_address,
+            }
+            for k, v in tokens.items():
                 if v:
                     out = out.replace(k, str(v))
             return out
