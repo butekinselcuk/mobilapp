@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import AsyncSessionLocal
 from models import User, UserQuestionHistory, UserFavoriteHadith, Hadith, Setting, ChatSession, ChatMessage
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert
 from vector_search import search_hadiths
 import logging
 from auth import get_current_user
@@ -1827,19 +1828,25 @@ async def get_quran(surah: str = None, ayah: int = None, language: str = 'tr', q
                     if fallback and surah_id:
                         async with AsyncSessionLocal() as s2:
                             for it in fallback:
-                                s2.add(QuranVerse(
-                                    surah=it['surah_name'] or it['surah'] or str(surah_id),
-                                    ayah=it['ayah'],
-                                    text=it['text_ar'] or it['text'],
-                                    translation=it['text_tr'],
-                                    language=it['language'],
-                                    surah_id=surah_id,
-                                    surah_name=it['surah_name'] or it['surah'],
-                                    ayah_number=it['ayah'],
-                                    text_ar=it['text_ar'],
-                                    text_tr=it['text_tr'],
-                                    audio_url=it['audio_url'],
-                                ))
+                                values = {
+                                    'surah': it['surah_name'] or it['surah'] or str(surah_id),
+                                    'ayah': it['ayah'],
+                                    'text': it['text_ar'] or it['text'],
+                                    'translation': it['text_tr'],
+                                    'language': it['language'],
+                                    'surah_id': surah_id,
+                                    'surah_name': it['surah_name'] or it['surah'],
+                                    'ayah_number': it['ayah'],
+                                    'text_ar': it['text_ar'],
+                                    'text_tr': it['text_tr'],
+                                    'audio_url': it['audio_url'],
+                                }
+                                stmt = insert(QuranVerse).values(**values)
+                                stmt = stmt.on_conflict_do_update(
+                                    constraint='uq_quran_surah_ayah_lang',
+                                    set=values
+                                )
+                                await s2.execute(stmt)
                             await s2.commit()
                 except Exception as e:
                     print('[quran seed fallback] yazma hatası:', str(e))
