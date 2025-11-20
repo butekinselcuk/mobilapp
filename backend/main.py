@@ -94,6 +94,16 @@ def _register_health_route():
 
 _register_health_route()
 
+# --- Yakın camiler için basit bellek önbelleği ve hız sınırlama ---
+_mosques_cache: dict = {}
+_MOSQUES_CACHE_TTL_SECONDS = 60
+_MOSQUES_CACHE_KEY_PRECISION = 3  # 0.001 ~ ~111m
+
+def _mk_mosques_cache_key(lat: float, lng: float, radius_km: float) -> str:
+    def _round(x: float) -> float:
+        return round(float(x), _MOSQUES_CACHE_KEY_PRECISION)
+    return f"{_round(lat)}:{_round(lng)}:{round(float(radius_km), 2)}"
+
 # Async tablo oluşturucu
 async def create_tables():
     async with engine.begin() as conn:
@@ -2277,6 +2287,18 @@ def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: flo
     """Yakındaki camileri döndürür.
     Öncelik Google Places; API anahtarı yoksa veya hata alınırsa Overpass (OSM) fallback kullanılır.
     """
+    # Basit bellek önbelleği: yakın çağrılarda dış servise gitmeden dön
+    try:
+        key = _mk_mosques_cache_key(lat, lng, radius)
+        entry = _mosques_cache.get(key)
+        if entry:
+            ts = entry.get('ts')
+            if ts and (datetime.utcnow() - ts).total_seconds() < _MOSQUES_CACHE_TTL_SECONDS:
+                data = entry.get('data')
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
     def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         R = 6371.0
         dlat = radians(lat2 - lat1)
@@ -2314,6 +2336,10 @@ def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: flo
                         "photo_reference": (item.get("photos", [{}])[0].get("photo_reference") if item.get("photos") else None),
                         "distance_km": round(haversine_km(lat, lng, mlat, mlon), 2),
                     })
+                try:
+                    _mosques_cache[key] = { 'ts': datetime.utcnow(), 'data': mosques }
+                except Exception:
+                    pass
                 return mosques
             else:
                 print("[nearby_mosques] Google non-200:", r.status_code, r.text[:200])
@@ -2350,6 +2376,10 @@ def nearby_mosques(lat: float = Query(...), lng: float = Query(...), radius: flo
                 "photo_reference": None,
                 "distance_km": round(haversine_km(lat, lng, mlat, mlon), 2),
             })
+        try:
+            _mosques_cache[key] = { 'ts': datetime.utcnow(), 'data': mosques }
+        except Exception:
+            pass
         return mosques
     except Exception as e:
         print("[nearby_mosques] Overpass exception:", str(e))
