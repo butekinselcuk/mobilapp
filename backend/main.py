@@ -56,7 +56,6 @@ except ImportError as e:
 
 # .env dosyasını yükle
 load_dotenv()
-print('DEBUG: SECRET_KEY =', os.getenv('SECRET_KEY'))
 
 app = FastAPI(
     swagger_ui_parameters={
