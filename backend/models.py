@@ -81,6 +81,7 @@ class Hadith(Base):
     hadis_no = Column(String, nullable=True)           # Hadis numarası
     arabic_text = Column(Text, nullable=True)          # Arapça metin
     turkish_text = Column(Text, nullable=True)         # Türkçe metin
+    english_text = Column(Text, nullable=True)         # İngilizce metin
     tags = Column(Text, nullable=True)                 # JSON string veya virgül ile ayrılmış
     topic = Column(String, nullable=True)              # Konu
     authenticity = Column(String, nullable=True)       # Sahih, zayıf vb.
