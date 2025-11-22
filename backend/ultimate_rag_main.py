@@ -75,7 +75,7 @@ def _build_hadith_context(hadith_dicts: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def _call_gemini(question: str, hadith_context: str) -> str:
+def _call_gemini(question: str, hadith_context: str, language: str = 'tr') -> str:
     """Gemini HTTP API çağrısı (opsiyonel).
 
     Ortam değişkenlerinden URL ve API key okur. Yapılandırılmamışsa özel bir işaret döner.
@@ -88,6 +88,7 @@ def _call_gemini(question: str, hadith_context: str) -> str:
         payload = {
             'question': question,
             'context': hadith_context,
+            'language': language,
         }
         headers = {
             'Authorization': f'Bearer {api_key}',
@@ -101,7 +102,7 @@ def _call_gemini(question: str, hadith_context: str) -> str:
     except Exception:
         return "__GEMINI_ERROR__"
 
-def _call_openai(question: str, hadith_context: str) -> str:
+def _call_openai(question: str, hadith_context: str, language: str = 'tr') -> str:
     """OpenAI Chat Completions çağrısı (HTTP üzerinden).
 
     Gerekli ortam değişkenleri: OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MAX_TOKENS, TEMPERATURE
@@ -118,14 +119,30 @@ def _call_openai(question: str, hadith_context: str) -> str:
             'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json'
         }
-        system_prompt = (
-            "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
-            "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
-        )
+        lang = (language or 'tr').lower()
+        if lang == 'en':
+            system_prompt = (
+                "Answer only using the Qur'an, Kutub al-Sittah and reputable fiqh sources. "
+                "Always include sources at the end. Do not add personal opinions."
+            )
+            answer_lang_directive = "Respond in English."
+        elif lang == 'ar':
+            system_prompt = (
+                "أجب فقط باستخدام القرآن وكتب الستّة ومصادر الفقه المعتبرة. "
+                "اذكر المصادر في نهاية كل إجابة. لا تُضِف آراءً شخصية."
+            )
+            answer_lang_directive = "أجب باللغة العربية."
+        else:
+            system_prompt = (
+                "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
+                "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
+            )
+            answer_lang_directive = "Cevabı Türkçe ver."
         user_text = (
-            f"Soru: {question}\n\n"
-            f"Bağlam (hadislerden alıntılar):\n{hadith_context}\n\n"
-            "Yukarıdaki bağlamdan yararlanarak güvenilir ve kaynaklı cevap ver."
+            f"Question: {question}\n\n"
+            f"Context (hadith excerpts):\n{hadith_context}\n\n"
+            "Use the context above to produce a reliable, sourced answer. "
+            f"{answer_lang_directive}"
         )
         body = {
             'model': model,
@@ -147,7 +164,7 @@ def _call_openai(question: str, hadith_context: str) -> str:
     except Exception:
         return "__OPENAI_ERROR__"
 
-def _call_claude(question: str, hadith_context: str) -> str:
+def _call_claude(question: str, hadith_context: str, language: str = 'tr') -> str:
     """Anthropic Claude Messages API çağrısı.
 
     Gerekli ortam değişkenleri: CLAUDE_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, TEMPERATURE
@@ -165,10 +182,25 @@ def _call_claude(question: str, hadith_context: str) -> str:
             'anthropic-version': '2023-06-01',
             'content-type': 'application/json'
         }
-        system_prompt = (
-            "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
-            "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
-        )
+        lang = (language or 'tr').lower()
+        if lang == 'en':
+            system_prompt = (
+                "Answer only using the Qur'an, Kutub al-Sittah and reputable fiqh sources. "
+                "Always include sources at the end. Do not add personal opinions."
+            )
+            answer_lang_directive = "Respond in English."
+        elif lang == 'ar':
+            system_prompt = (
+                "أجب فقط باستخدام القرآن وكتب الستّة ومصادر الفقه المعتبرة. "
+                "اذكر المصادر في نهاية كل إجابة. لا تُضِف آراءً شخصية."
+            )
+            answer_lang_directive = "أجب باللغة العربية."
+        else:
+            system_prompt = (
+                "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
+                "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
+            )
+            answer_lang_directive = "Cevabı Türkçe ver."
         body = {
             'model': model,
             'max_tokens': max_tokens,
@@ -181,8 +213,9 @@ def _call_claude(question: str, hadith_context: str) -> str:
                         {
                             'type': 'text',
                             'text': (
-                                f"Soru: {question}\n\nBağlam (hadislerden alıntılar):\n{hadith_context}\n\n"
-                                "Yukarıdaki bağlamdan yararlanarak güvenilir ve kaynaklı cevap ver."
+                                f"Question: {question}\n\nContext (hadith excerpts):\n{hadith_context}\n\n"
+                                "Use the context above to produce a reliable, sourced answer. "
+                                f"{answer_lang_directive}"
                             )
                         }
                     ]
@@ -202,7 +235,7 @@ def _call_claude(question: str, hadith_context: str) -> str:
         return "__CLAUDE_ERROR__"
 
 
-def generate_ai_response_with_fallback(question: str, hadith_dicts: List[Dict], enable_gemini_fallback: bool = True) -> Tuple[str, bool, str]:
+def generate_ai_response_with_fallback(question: str, hadith_dicts: List[Dict], enable_gemini_fallback: bool = True, language: str = 'tr') -> Tuple[str, bool, str]:
     """Önce yerel Hadis AI ile yanıt üretir, sonra PRIMARY/FALLBACK AI modeline göre düşer.
 
     Returns: (answer, used_fallback, response_type)
@@ -228,11 +261,11 @@ def generate_ai_response_with_fallback(question: str, hadith_dicts: List[Dict], 
 
     def _call_by_name(name: str) -> Tuple[str, str]:
         if name == 'openai':
-            return _call_openai(question, hadith_context), 'openai'
+            return _call_openai(question, hadith_context, language), 'openai'
         if name == 'claude':
-            return _call_claude(question, hadith_context), 'claude'
+            return _call_claude(question, hadith_context, language), 'claude'
         if name == 'gemini' and enable_gemini_fallback:
-            return _call_gemini(question, hadith_context), 'gemini'
+            return _call_gemini(question, hadith_context, language), 'gemini'
         # Tanınmayan isim -> yapılandırılmamış say
         return "__MODEL_NOT_CONFIGURED__", name or 'unknown'
 
