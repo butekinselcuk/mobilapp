@@ -364,7 +364,26 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             _suffix = ' -AI CL'
         elif 'gemini' in _rt:
             _suffix = ' -AI GMN'
-        filtered_sources.append(SourceItem(type="ai", name=f"AI Asistan{_suffix}"))
+        # Cevap içinde özel isim/kitap yakalama
+        def _extract_ai_refs(text: str) -> list:
+            pats = [
+                r"\b(Bukhari|Sahih\s+al[- ]?Bukhari|Müslim|Sahih\s+Muslim|Tirmi[dz]i|Abu\s+Dawud|Nasa['’]?i|Ibn\s+Majah|Muwatta)\b",
+                r"\b(Ibn\s+Taymiyyah|al[- ]?Ghazali|al[- ]?Shafi'i|Abu\s+Hanifa|Imam\s+Malik|Ahmad\s+ibn\s+Hanbal)\b",
+                r"\b(al[- ]?Mughni|Bidayat\s+al[- ]?Mujtahid|al[- ]?Umm|al[- ]?Risala)\b",
+            ]
+            found = []
+            for p in pats:
+                for m in re.finditer(p, text, flags=re.IGNORECASE):
+                    val = m.group(0).strip()
+                    if val and val.lower() != 'none' and val not in found:
+                        found.append(val)
+            return found
+        ai_refs = _extract_ai_refs(answer)
+        if ai_refs:
+            for ref in ai_refs:
+                filtered_sources.append(SourceItem(type="ai", name=ref))
+        else:
+            filtered_sources.append(SourceItem(type="ai", name=f"AI Asistan{_suffix}"))
         sources = filtered_sources if filtered_sources else sources
     else:
         sources = []
@@ -397,6 +416,32 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             )
         )
         sources = []
+    # Cevaba uygun giriş
+    def _prefix(lang: str, has_hadith: bool, src_filter: str) -> str:
+        lg = (lang or 'tr').lower()
+        if has_hadith:
+            return (
+                "Hadis kaynaklarına göre: " if lg == 'tr' else (
+                    "According to hadith sources: " if lg == 'en' else "وفقًا لمصادر الحديث: "
+                )
+            )
+        if (src_filter or 'all') == 'quran':
+            return (
+                "Kur'an-ı Kerim'e göre: " if lg == 'tr' else (
+                    "According to the Qur'an: " if lg == 'en' else "وفقًا للقرآن الكريم: "
+                )
+            )
+        return (
+            "Bu soru ile ilgili sahih hadis kaynaklarında doğrudan bir hadis ve bilgi bulamadım. Lakin İslam âleminin önde gelen fıkıh âlimlerine göre, " if lg == 'tr' else (
+                "I could not find a direct hadith or information in authentic hadith sources for this question. However, according to leading fiqh scholars, " if lg == 'en' else "لم أجد حديثًا مباشرًا أو معلومة في مصادر الحديث الموثوقة لهذه المسألة. ومع ذلك، ووفقًا لكبار علماء الفقه، "
+            )
+        )
+    try:
+        lang = (request.language or 'tr')
+        pref = _prefix(lang, bool(hadith_dicts and len(hadith_dicts) > 0), request.source_filter or 'all')
+        answer = f"{pref}{answer}" if pref and isinstance(answer, str) and not answer.strip().lower().startswith(pref.strip().lower()[:20]) else answer
+    except Exception:
+        pass
     # Genel yönlendirme veya açıklama isteyen cevaplarda kaynaklar kutusu gösterilmesin
     # Yönlendirme niteliğindeki cevaplarda dahi hadis bulunduysa kaynaklar korunur.
     # --- Kullanıcı geçmişine otomatik kayıt ---
@@ -570,6 +615,21 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
             else:
                 sources = []
 
+            # Cevaba uygun giriş ekle (hadis/kuran/yok)
+            def _prefix(lang: str, has_hadith: bool, src_filter: str) -> str:
+                lg = (lang or 'tr').lower()
+                if has_hadith:
+                    return ("Hadis kaynaklarına göre: " if lg == 'tr' else ("According to hadith sources: " if lg == 'en' else "وفقًا لمصادر الحديث: "))
+                if (src_filter or 'all') == 'quran':
+                    return ("Kur'an-ı Kerim'e göre: " if lg == 'tr' else ("According to the Qur'an: " if lg == 'en' else "وفقًا للقرآن الكريم: "))
+                return ("Bu soru ile ilgili sahih hadis kaynaklarında doğrudan bir hadis ve bilgi bulamadım. Lakin İslam âleminin önde gelen fıkıh âlimlerine göre, " if lg == 'tr' else ("I could not find a direct hadith or information in authentic hadith sources for this question. However, according to leading fiqh scholars, " if lg == 'en' else "لم أجد حديثًا مباشرًا أو معلومة في مصادر الحديث الموثوقة لهذه المسألة. ومع ذلك، ووفقًا لكبار علماء الفقه، "))
+            try:
+                lang = (request.language or 'tr')
+                pref = _prefix(lang, bool(hadith_dicts and len(hadith_dicts) > 0), request.source_filter or 'all')
+                answer = f"{pref}{answer}" if pref and isinstance(answer, str) and not answer.strip().lower().startswith(pref.strip().lower()[:20]) else answer
+            except Exception:
+                pass
+
             response = AskResponse(answer=answer, sources=sources)
     # Session'a mesajları kaydet
     async with AsyncSessionLocal() as session:
@@ -616,17 +676,31 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
 @app.get("/api/hadith_search")
 async def hadith_search(q: str = Query(..., description="Aranacak metin"), top_k: int = 3) -> Any:
     results = await search_hadiths(q, top_k=top_k)
-    return [
-        {
-            "id": h.id,
+    def _clean_val(v: str) -> str:
+        v = (v or '').strip()
+        return '' if not v or v.lower() == 'none' else v
+    out = []
+    for h in results:
+        src = _clean_val(getattr(h, 'source', None))
+        kitap = _clean_val(getattr(h, 'kitap', None))
+        bab = _clean_val(getattr(h, 'bab', None))
+        hno = _clean_val(getattr(h, 'hadis_no', None))
+        ref_raw = _clean_val(getattr(h, 'reference', None))
+        parts = []
+        if kitap: parts.append(kitap)
+        if bab: parts.append(bab)
+        if hno: parts.append(f"No: {hno}")
+        if ref_raw: parts.append(ref_raw)
+        ref = ' · '.join(parts)
+        out.append({
+            "id": getattr(h, 'id', None),
             "text": getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', ''),
-            "source": h.source,
-            "reference": h.reference,
-            "category": h.category,
-            "language": h.language
-        }
-        for h in results
-    ]
+            "source": src,
+            "reference": ref,
+            "category": getattr(h, 'category', None),
+            "language": getattr(h, 'language', None)
+        })
+    return out
 
 # NOT: Gerçek ortamda JWT ile kimlik doğrulama zorunlu olmalı. Demo için user_id parametresiyle ilerleniyor.
 
@@ -712,16 +786,34 @@ async def get_user_favorites(
             q = q.order_by(sort_col.desc())
         result = await session.execute(q)
         favs = result.scalars().all()
-        return [
-            {
-                "id": f.hadith.id,
-                "text": f.hadith.turkish_text or f.hadith.arabic_text,
-                "source": f.hadith.source,
-                "reference": f.hadith.reference,
-                "category": f.hadith.category,
-                "language": f.hadith.language
-            } for f in favs if f.hadith
-        ]
+        def _clean_val(v: str) -> str:
+            v = (v or '').strip()
+            return '' if not v or v.lower() == 'none' else v
+        out = []
+        for f in favs:
+            if not f.hadith:
+                continue
+            h = f.hadith
+            src = _clean_val(getattr(h, 'source', None))
+            kitap = _clean_val(getattr(h, 'kitap', None))
+            bab = _clean_val(getattr(h, 'bab', None))
+            hno = _clean_val(getattr(h, 'hadis_no', None))
+            ref_raw = _clean_val(getattr(h, 'reference', None))
+            parts = []
+            if kitap: parts.append(kitap)
+            if bab: parts.append(bab)
+            if hno: parts.append(f"No: {hno}")
+            if ref_raw: parts.append(ref_raw)
+            ref = ' · '.join(parts)
+            out.append({
+                "id": getattr(h, 'id', None),
+                "text": getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or getattr(h, 'text', ''),
+                "source": src,
+                "reference": ref,
+                "category": getattr(h, 'category', None),
+                "language": getattr(h, 'language', None)
+            })
+        return out
 
 @app.post("/user/favorites")
 async def add_favorite(hadith_id: int, current_user: User = Depends(get_current_user)):
