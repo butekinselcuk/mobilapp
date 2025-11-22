@@ -242,6 +242,7 @@ app.include_router(auth_router, prefix="/auth")
 class AskRequest(BaseModel):
     question: str
     source_filter: Optional[str] = "all"  # "quran", "hadis", "all"
+    language: Optional[str] = "tr"
 
 class SourceItem(BaseModel):
     type: str
@@ -263,6 +264,7 @@ class ChatRequest(BaseModel):
     question: str
     session_token: Optional[str] = None
     source_filter: Optional[str] = "all"
+    language: Optional[str] = "tr"
 
 class ChatResponse(BaseModel):
     answer: str
@@ -312,7 +314,8 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
     answer, used_fallback, response_type = generate_ai_response_with_fallback(
         request.question,
         hadith_dicts,
-        True
+        True,
+        request.language or 'tr'
     )
     # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
     if not hadith_dicts:
@@ -360,15 +363,30 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
     system_prompt_start = system_prompt[:80].lower()
     # Kısa/tek kelime sorularda kullanıcıyı yönlendir
     if len(request.question.strip().split()) < 2:
-        answer = "Sorunuzu daha açık yazar mısınız?"
+        lang = (request.language or 'tr').lower()
+        answer = (
+            "Sorunuzu daha açık yazar mısınız?" if lang == 'tr' else (
+                "Please clarify your question." if lang == 'en' else "يرجى توضيح سؤالك."
+            )
+        )
         sources = []
     # Modelden gelen cevap sistem promptuna çok benziyorsa veya 'anlaşıldı' ile başlıyorsa override et
     if answer.lower().startswith(system_prompt_start) or "resmi yapay zeka asistanı" in answer.lower() or answer.lower().startswith("anlaşıldı") or "bundan sonra" in answer.lower():
-        answer = "Sorunuzu daha açık yazar mısınız?"
+        lang = (request.language or 'tr').lower()
+        answer = (
+            "Sorunuzu daha açık yazar mısınız?" if lang == 'tr' else (
+                "Please clarify your question." if lang == 'en' else "يرجى توضيح سؤالك."
+            )
+        )
         sources = []
     # Selamlaşma mesajlarında özel karşılama
-    if request.question.strip().lower() in ["selam", "merhaba", "merhabalar", "selamünaleyküm"]:
-        answer = "Merhaba! Size nasıl yardımcı olabilirim?"
+    if request.question.strip().lower() in ["selam", "merhaba", "merhabalar", "selamünaleyküm", "hello", "hi", "salam", "السلام عليكم"]:
+        lang = (request.language or 'tr').lower()
+        answer = (
+            "Merhaba! Size nasıl yardımcı olabilirim?" if lang == 'tr' else (
+                "Hello! How can I help you?" if lang == 'en' else "مرحبًا! كيف يمكنني مساعدتك؟"
+            )
+        )
         sources = []
     # Genel yönlendirme veya açıklama isteyen cevaplarda kaynaklar kutusu gösterilmesin
     # Yönlendirme niteliğindeki cevaplarda dahi hadis bulunduysa kaynaklar korunur.
@@ -471,7 +489,7 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
         request.session_token = str(uuid.uuid4())
     
     # Mevcut ask_ai fonksiyonunu kullan
-    ask_request = AskRequest(question=request.question, source_filter=request.source_filter)
+    ask_request = AskRequest(question=request.question, source_filter=request.source_filter, language=request.language or 'tr')
     
     # Kullanıcı varsa normal ask_ai'yi çağır, yoksa session tabanlı işlem yap
     if current_user:
@@ -480,7 +498,12 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
         # Anonim kullanıcı için Ultimate RAG + akıllı fallback
         # Tek kelime veya çok kısa sorularda yönlendir
         if len([w for w in request.question.strip().split() if w]) < 2:
-            answer = "Sorunuzu daha açık yazar mısınız?"
+            lang = (request.language or 'tr').lower()
+            answer = (
+                "Sorunuzu daha açık yazar mısınız?" if lang == 'tr' else (
+                    "Please clarify your question." if lang == 'en' else "يرجى توضيح سؤالك."
+                )
+            )
             sources = []
             response = AskResponse(answer=answer, sources=sources)
         else:
@@ -488,14 +511,18 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
             answer, used_fallback, response_type = generate_ai_response_with_fallback(
                 request.question,
                 hadith_dicts,
-                True
+                True,
+                request.language or 'tr'
             )
             # Hadis bulunamadığında ayardan okunabilir bir fallback mesajı göster
             if not hadith_dicts:
-                answer = await get_setting(
-                    'ai_no_hadith_message',
-                    'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.'
+                lang = (request.language or 'tr').lower()
+                default_msg = (
+                    'Bu konuda güvenilir hadis kaynağı bulunamadı. Lütfen sorunuzu farklı şekilde ifade edin.' if lang == 'tr' else (
+                        'No reliable hadith source was found on this topic. Please try rephrasing your question.' if lang == 'en' else 'لم يتم العثور على مصدر حديث موثوق في هذا الموضوع. يرجى إعادة صياغة سؤالك.'
+                    )
                 )
+                answer = await get_setting('ai_no_hadith_message', default_msg)
             # Kaynakları hazırla (UI için sade gösterim)
             sources = []
             for h in hadith_dicts:
