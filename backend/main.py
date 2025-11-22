@@ -2215,7 +2215,13 @@ async def get_daily_ayah(language: str = 'tr'):
             return { 'text': '', 'reference': '' }
         return {
             'text': getattr(v, 'text', None) or getattr(v, 'text_tr', None) or '',
-            'reference': f"{getattr(v, 'surah', '')} {getattr(v, 'ayah', '')}"
+            'reference': f"{getattr(v, 'surah', '')} {getattr(v, 'ayah', '')}",
+            'text_ar': getattr(v, 'text_ar', None) or '',
+            'text_tr': getattr(v, 'text_tr', None) or '',
+            'surah_id': getattr(v, 'surah_id', None),
+            'surah_name': getattr(v, 'surah_name', None) or getattr(v, 'surah', None),
+            'ayah_id': getattr(v, 'ayah_number', None) or getattr(v, 'ayah', None),
+            'source': 'sql'
         }
 
 # Günün Hadisi (SQL’den deterministik seçim)
@@ -2242,17 +2248,29 @@ async def get_daily_hadith(language: str = 'tr'):
         if not h:
             return { 'text': '', 'reference': '' }
         # Hadis metni alan önceliği
-        text_val = (
-            getattr(h, 'turkish_text', None)
-            or getattr(h, 'text_tr', None)
-            or getattr(h, 'text', None)
-            or getattr(h, 'english_text', None)
-            or getattr(h, 'arabic_text', None)
-            or ''
-        )
-        ref = (
-            f"{getattr(h, 'source', '')} {getattr(h, 'reference', '')}"
-        ).strip()
+        # Dil önceliği
+        def _pick_text():
+            if language == 'en':
+                return (getattr(h, 'english_text', None) or getattr(h, 'text', None) or getattr(h, 'turkish_text', None) or getattr(h, 'arabic_text', None) or '')
+            if language == 'ar':
+                return (getattr(h, 'arabic_text', None) or getattr(h, 'text', None) or getattr(h, 'turkish_text', None) or '')
+            # varsayılan 'tr'
+            return (getattr(h, 'turkish_text', None) or getattr(h, 'text_tr', None) or getattr(h, 'text', None) or getattr(h, 'arabic_text', None) or '')
+
+        text_val = _pick_text()
+
+        # Referans biçimi: kitap, bab, hadis_no ve/veya source
+        parts = []
+        src = (getattr(h, 'source', None) or '').strip()
+        kitap = (getattr(h, 'kitap', None) or '').strip()
+        bab = (getattr(h, 'bab', None) or '').strip()
+        hno = (getattr(h, 'hadis_no', None) or '').strip()
+        ref_raw = (getattr(h, 'reference', None) or '').strip()
+        for p in [src, kitap, bab, (f"No: {hno}" if hno else '') or '', ref_raw]:
+            if p and p.lower() != 'none':
+                parts.append(p)
+        ref = ' · '.join(parts)
+
         return {
             'text': text_val,
             'reference': ref,
