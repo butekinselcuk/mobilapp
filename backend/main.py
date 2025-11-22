@@ -2231,7 +2231,7 @@ async def get_daily_hadith(language: str = 'tr'):
     from datetime import datetime
     async with AsyncSessionLocal() as session:
         count_res = await session.execute(
-            select(func.count()).where(Hadith.language == language)
+            select(func.count()).select_from(Hadith)
         )
         total = count_res.scalar() or 0
         if total == 0:
@@ -2239,7 +2239,6 @@ async def get_daily_hadith(language: str = 'tr'):
         day_idx = datetime.utcnow().timetuple().tm_yday % total
         hadith_res = await session.execute(
             select(Hadith)
-            .where(Hadith.language == language)
             .order_by(Hadith.id)
             .offset(day_idx)
             .limit(1)
@@ -2251,11 +2250,11 @@ async def get_daily_hadith(language: str = 'tr'):
         # Dil önceliği
         def _pick_text():
             if language == 'en':
-                return (getattr(h, 'english_text', None) or getattr(h, 'text', None) or getattr(h, 'turkish_text', None) or getattr(h, 'arabic_text', None) or '')
+                return (getattr(h, 'english_text', None) or getattr(h, 'turkish_text', None) or getattr(h, 'arabic_text', None) or '')
             if language == 'ar':
-                return (getattr(h, 'arabic_text', None) or getattr(h, 'text', None) or getattr(h, 'turkish_text', None) or '')
+                return (getattr(h, 'arabic_text', None) or getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or '')
             # varsayılan 'tr'
-            return (getattr(h, 'turkish_text', None) or getattr(h, 'text_tr', None) or getattr(h, 'text', None) or getattr(h, 'arabic_text', None) or '')
+            return (getattr(h, 'turkish_text', None) or getattr(h, 'english_text', None) or getattr(h, 'arabic_text', None) or '')
 
         text_val = _pick_text()
 
