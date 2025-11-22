@@ -123,19 +123,22 @@ def _call_openai(question: str, hadith_context: str, language: str = 'tr') -> st
         if lang == 'en':
             system_prompt = (
                 "Answer only using the Qur'an, Kutub al-Sittah and reputable fiqh sources. "
-                "Always include sources at the end. Do not add personal opinions."
+                "Always include precise sources at the end (book name and hadith number if available; for fiqh, scholar name and work). "
+                "Do not add personal opinions."
             )
             answer_lang_directive = "Respond in English."
         elif lang == 'ar':
             system_prompt = (
                 "أجب فقط باستخدام القرآن وكتب الستّة ومصادر الفقه المعتبرة. "
-                "اذكر المصادر في نهاية كل إجابة. لا تُضِف آراءً شخصية."
+                "اذكر مصادر دقيقة في نهاية الإجابة (اسم الكتاب ورقم الحديث إن وُجد، وللفقه اسم العالم وكتابه). "
+                "لا تُضِف آراءً شخصية."
             )
             answer_lang_directive = "أجب باللغة العربية."
         else:
             system_prompt = (
                 "Sadece Kur'an, Kütüb-i Sitte ve muteber fıkıh kaynaklarından cevap ver. "
-                "Her cevabın sonunda kaynak belirt. Kişisel yorum ekleme."
+                "Kaynakları her zaman somut ve net yaz (kitap adı ve hadis numarası varsa ekle; fıkıh için âlim adı ve eseri). "
+                "Kişisel yorum ekleme."
             )
             answer_lang_directive = "Cevabı Türkçe ver."
         user_text = (
@@ -214,7 +217,7 @@ def _call_claude(question: str, hadith_context: str, language: str = 'tr') -> st
                             'type': 'text',
                             'text': (
                                 f"Question: {question}\n\nContext (hadith excerpts):\n{hadith_context}\n\n"
-                                "Use the context above to produce a reliable, sourced answer. "
+                                "Use the context above to produce a reliable answer with precise sources. "
                                 f"{answer_lang_directive}"
                             )
                         }
