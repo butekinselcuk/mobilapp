@@ -19,6 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from vector_search import search_hadiths
 import logging
+import re
 from auth import get_current_user
 from auth import get_current_user_optional
 from sqlalchemy.orm import selectinload
@@ -329,7 +330,11 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
         base = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
         score = h.get('score')
         display = f"{base} (skor: {score:.2f})" if isinstance(score, (int, float)) and score is not None else base
-        sources.append(SourceItem(type="hadis", name=display))
+        def _clean_source_text(s: str) -> str:
+            tokens = re.split(r"\s*[\-·]\s*", s)
+            tokens = [t.strip() for t in tokens if t and t.strip().lower() != "none"]
+            return " · ".join(tokens)
+        sources.append(SourceItem(type="hadis", name=_clean_source_text(display)))
     ai_source = "ultimate_rag"
     # Gelişmiş kaynaklar kutusu mantığı
     system_prompt = (
@@ -347,7 +352,11 @@ async def ask_ai(request: AskRequest, current_user: User = Depends(get_current_u
             h_text = (h.get('text') or '')
             h_ref = (h.get('reference') or '')
             if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
-                filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
+                def _clean_source_text(s: str) -> str:
+                    tokens = re.split(r"\s*[\-·]\s*", s)
+                    tokens = [t.strip() for t in tokens if t and t.strip().lower() != "none"]
+                    return " · ".join(tokens)
+                filtered_sources.append(SourceItem(type="hadis", name=_clean_source_text(f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}")))
         # AI suffix: model türüne göre etiketle
         _rt = (response_type or '').lower()
         _suffix = ' -AI'
@@ -524,12 +533,16 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
                 )
                 answer = await get_setting('ai_no_hadith_message', default_msg)
             # Kaynakları hazırla (UI için sade gösterim)
-            sources = []
-            for h in hadith_dicts:
-                base = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
-                score = h.get('score')
-                display = f"{base} (skor: {score:.2f})" if isinstance(score, (int, float)) and score is not None else base
-                sources.append(SourceItem(type="hadis", name=display))
+        sources = []
+        for h in hadith_dicts:
+            base = f"{h['full_reference']} - {h['text'][:60]}" if h.get('full_reference') else f"{h.get('source','')} - {h.get('reference','')}"
+            score = h.get('score')
+            display = f"{base} (skor: {score:.2f})" if isinstance(score, (int, float)) and score is not None else base
+            def _clean_source_text(s: str) -> str:
+                tokens = re.split(r"\s*[\-·]\s*", s)
+                tokens = [t.strip() for t in tokens if t and t.strip().lower() != "none"]
+                return " · ".join(tokens)
+            sources.append(SourceItem(type="hadis", name=_clean_source_text(display)))
 
             # Gelişmiş kaynaklar kutusu mantığı (ask_ai ile uyumlu)
             # Kaynakları her zaman göster: hadis bulunduysa listeyi koru,
@@ -541,7 +554,11 @@ async def chat_with_session(request: ChatRequest, current_user: User = Depends(g
                     h_text = (h.get('text') or '')
                     h_ref = (h.get('reference') or '')
                     if (h_text[:40].lower() in answer_lower) or (h_ref.lower() in answer_lower):
-                        filtered_sources.append(SourceItem(type="hadis", name=f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}"))
+                        def _clean_source_text(s: str) -> str:
+                            tokens = re.split(r"\s*[\-·]\s*", s)
+                            tokens = [t.strip() for t in tokens if t and t.strip().lower() != "none"]
+                            return " · ".join(tokens)
+                        filtered_sources.append(SourceItem(type="hadis", name=_clean_source_text(f"{h.get('full_reference') or (h.get('source','') + ' - ' + h_ref)}")))
                 _rt = (response_type or '').lower()
                 _suffix = ' -AI'
                 if 'claude' in _rt:
